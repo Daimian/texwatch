@@ -66,10 +66,27 @@ export function parseLog(rawLog, root) {
       // 形如 ./main.tex:3: Undefined control sequence.
       const message = fle[3].trim()
       if (message) {
+        const file = toRelative(fle[1], root)
+        const lineNo = Number(fle[2])
+        // 前缀里的内容也可能是警告（如 "./main.tex:5: LaTeX Warning: ..."），
+        // 这种情况仍要判成 warning，但保留前缀解析出的 file/line。
+        const warnInPrefix = message.match(WARNING)
+        if (warnInPrefix) {
+          const warnMessage = `${warnInPrefix[1]}: ${warnInPrefix[2].trim()}`
+          diagnostics.push({
+            severity: 'warning',
+            file,
+            line: lineNo,
+            message: warnMessage,
+            hint: warningHint(warnMessage),
+            raw: lines.slice(i, i + 2).join('\n'),
+          })
+          continue
+        }
         diagnostics.push({
           severity: 'error',
-          file: toRelative(fle[1], root),
-          line: Number(fle[2]),
+          file,
+          line: lineNo,
           message,
           hint: hintFor(message),
           raw: lines.slice(i, i + 3).join('\n'),
