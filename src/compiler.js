@@ -69,34 +69,62 @@ function spawnCapture({ cmd, args, cwd, timeoutMs }) {
     child.stdout.on('data', (b) => { output += b })
     child.stderr.on('data', (b) => { output += b })
 
+    let killTimer = null
     const timer = setTimeout(() => {
       timedOut = true
       child.kill('SIGTERM')
-      setTimeout(() => child.kill('SIGKILL'), 5000).unref()
+      // 存下句柄，进程若在 SIGKILL 触发前已经退出（close/error 已 resolve），要能 clearTimeout，
+      // 避免 5 秒后仍对着一个早已不存在的 pid 调 kill（虽然 Node 会静默返回 false、无实际危害，
+      // 但存句柄成本为零，能让这条定时器的生命周期完整可控）。
+      killTimer = setTimeout(() => child.kill('SIGKILL'), 5000)
+      killTimer.unref()
     }, timeoutMs)
 
     child.on('error', (err) => {
       clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
       resolve({ output: `${output}\n${err.message}`, code: -1, timedOut })
     })
     child.on('close', (code) => {
       clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
       resolve({ output, code, timedOut })
     })
   })
 }
 
+async function statPdf(pdfPath) {
+  try {
+    const st = await fs.stat(pdfPath)
+    return { exists: st.size > 0, mtimeMs: st.mtimeMs }
+  } catch {
+    return { exists: false, mtimeMs: null }
+  }
+}
+
 /**
  * CompileResult = {
- *   ok,          // 这一轮有没有产出 PDF（不看退出码——非零退出码 + 可用 PDF 是 LaTeX 的常态，
- *                // 例如 authoryear 文档类配 elsarticle-num 样式时 natbib 报错但自恢复，
- *                // PDF 依然正确。若用 exitCode === 0 判定成功，这类论文会被永远判为失败。）
- *   pdfPath,     // 产出的 PDF 路径，没有则为 null
+ *   ok,          // 这一轮有没有真的产出可用 PDF：
+ *                //   !timedOut && pdfExists && (pdfChanged || exitCode === 0)
+ *                // 不看退出码本身——非零退出码 + 可用 PDF 是 LaTeX 的常态，例如 authoryear
+ *                // 文档类配 elsarticle-num 样式时 natbib 报错但自恢复，PDF 依然正确。若单用
+ *                // exitCode === 0 判定成功，这类论文会被永远判为失败。
+ *                // 但只看「PDF 存在」也不够：outDir 是增量编译复用的，本轮致命报错（比如
+ *                // Emergency stop）时 latexmk 会原样留着上一轮的旧 PDF 不动，此时必须能
+ *                // 分辨出「这是旧图」而不是本轮产物，否则用户会把旧图误当成改动已生效。
+ *                // pdfChanged = 编译前 PDF 不存在，或编译前后 mtime 不同。
+ *                // 光看 pdfChanged 也不够：latexmk 判定无需重编时会原样保留 PDF 不重写
+ *                // （常见于没有 -g 强制全量的普通改动），此时 pdfChanged 为 false 但这是
+ *                // 完全正常的成功，靠 exitCode === 0 兜住这种情况。
+ *   pdfPath,     // outDir 里当前存在的 PDF 路径，没有则为 null（与 ok 无关——ok 为 false
+ *                // 时如果 outDir 里还留着旧 PDF，这里仍会指向那个旧文件，由调用方结合 ok
+ *                // 自行决定要不要展示/更新 lastGoodPdf）
  *   durationMs,
  *   diagnostics, // parseLog 解析出的诊断列表，与 ok 无关——有 error 诊断不代表 ok 为 false
  *   rawLog,
  *   timedOut,
- *   exitCode,    // latexmk/pdflatex 的退出码，仅供参考展示，不参与 ok 的判定
+ *   exitCode,    // latexmk/pdflatex 的退出码，仅在判定「PDF 未变但确实无需重编」时参与 ok，
+ *                // 不代表「退出码非零就是失败」
  * }
  */
 export async function runCompile({
@@ -108,6 +136,12 @@ export async function runCompile({
 }) {
   const started = Date.now()
   await fs.mkdir(config.outDir, { recursive: true })
+
+  const pdfPath = path.join(
+    config.outDir,
+    `${path.basename(config.mainTex, '.tex')}.pdf`
+  )
+  const before = await statPdf(pdfPath)
 
   const { cmd, args } = commandOverride ?? {
     cmd: 'latexmk',
@@ -139,23 +173,17 @@ export async function runCompile({
     ? [{ severity: 'error', file: null, line: null, message: `编译超时（超过 ${timeoutMs / 1000} 秒）已被终止`, hint: '可以先跑 texwatch --clean 清掉可能损坏的中间文件', raw: '' }]
     : parseLog(rawLog, config.root)
 
-  const pdfPath = path.join(
-    config.outDir,
-    `${path.basename(config.mainTex, '.tex')}.pdf`
-  )
-  let pdfExists = false
-  try {
-    pdfExists = (await fs.stat(pdfPath)).size > 0
-  } catch {
-    pdfExists = false
-  }
+  const after = await statPdf(pdfPath)
+  const pdfChanged = !before.exists || after.mtimeMs !== before.mtimeMs
 
-  // ok 只看「有没有产出可用 PDF」，不看退出码：非零退出码 + 正确 PDF 是常态。
-  const ok = !timedOut && pdfExists
+  // ok 既不看「退出码是否为 0」，也不能只看「PDF 是否存在」——必须能区分本轮真产出的 PDF
+  // 和 outDir 里遗留的旧 PDF。pdfChanged 分辨新旧；无需重编（PDF 未变但 exitCode === 0）
+  // 时靠 exitCode 兜底，因为那也是合法的成功。
+  const ok = !timedOut && after.exists && (pdfChanged || code === 0)
 
   return {
     ok,
-    pdfPath: pdfExists ? pdfPath : null,
+    pdfPath: after.exists ? pdfPath : null,
     durationMs: Date.now() - started,
     diagnostics,
     rawLog,
