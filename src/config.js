@@ -54,7 +54,7 @@ export function pickMain({ cliArg, rcMain, candidates }) {
 const DEFAULTS = {
   port: 3577,
   draft: false,
-  watchExtensions: ['.tex', '.bib', '.cls', '.bst', '.png', '.jpg', '.jpeg', '.pdf', '.eps'],
+  watchExtensions: ['.tex', '.bib', '.cls', '.bst', '.sty', '.png', '.jpg', '.jpeg', '.pdf', '.eps'],
   ignoreDirs: ['.texwatch', '.git', 'node_modules'],
 }
 

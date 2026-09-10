@@ -62,6 +62,7 @@ test('默认值：端口 3577、非 draft、忽略 .texwatch', async () => {
   assert.equal(cfg.draft, false)
   assert.ok(cfg.ignoreDirs.includes('.texwatch'))
   assert.ok(cfg.watchExtensions.includes('.tex'))
+  assert.ok(cfg.watchExtensions.includes('.sty'))
   assert.equal(path.basename(cfg.outDir), 'build')
 })
 

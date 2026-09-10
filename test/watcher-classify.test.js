@@ -11,6 +11,14 @@ const config = {
   ignoreDirs: ['.texwatch', '.git'],
 }
 
+const configWithSty = {
+  root: '/proj',
+  mainTex: '/proj/main.tex',
+  preambleEndLine: 58,
+  watchExtensions: ['.tex', '.bib', '.cls', '.bst', '.sty', '.png', '.jpg', '.pdf'],
+  ignoreDirs: ['.texwatch', '.git'],
+}
+
 test('主文件、改动行在 preamble 内 → preamble', () => {
   assert.equal(classify('/proj/main.tex', { config, changedLine: 20 }), 'preamble')
 })
@@ -54,4 +62,35 @@ test('shouldWatch 与 classify 的判定一致', () => {
   assert.equal(shouldWatch('/proj/main.tex', config), true)
   assert.equal(shouldWatch('/proj/notes.md', config), false)
   assert.equal(shouldWatch('/proj/.texwatch/build/main.pdf', config), false)
+})
+
+test('.sty 宏包 → tex', () => {
+  assert.equal(classify('/proj/mymacro.sty', { config: configWithSty }), 'tex')
+})
+
+test('主文件、改动行恰好在 preambleEndLine → preamble', () => {
+  assert.equal(classify('/proj/main.tex', { config, changedLine: 58 }), 'preamble')
+})
+
+test('ignoreDirs 的反例：my.git-notes 或 not-node_modules 不应被忽略', () => {
+  const cfgWithPaths = {
+    ...config,
+    ignoreDirs: ['node_modules', '.git'],
+  }
+  assert.equal(classify('/proj/my.git-notes/file.tex', { config: cfgWithPaths }), 'tex')
+  assert.equal(classify('/proj/not-node_modules/file.tex', { config: cfgWithPaths }), 'tex')
+})
+
+test('传入相对路径时按 config.root 解析', () => {
+  const cfgForRelative = {
+    root: '/proj',
+    mainTex: '/proj/main.tex',
+    preambleEndLine: 58,
+    watchExtensions: ['.tex', '.bib'],
+    ignoreDirs: ['.texwatch'],
+  }
+  // 相对路径应该按 config.root 解析为绝对路径后再判断
+  assert.equal(classify('main.tex', { config: cfgForRelative }), 'preamble')
+  assert.equal(classify('SI.tex', { config: cfgForRelative }), 'tex')
+  assert.equal(classify('.texwatch/build/main.pdf', { config: cfgForRelative }), null)
 })
