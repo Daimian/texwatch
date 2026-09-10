@@ -4,6 +4,8 @@ import path from 'node:path'
 import { parseArgv, formatDiagnostics } from '../src/cli-args.js'
 import { resolveConfig } from '../src/config.js'
 import { runCompile, hasTexToolchain } from '../src/compiler.js'
+import { createWatcher } from '../src/watcher.js'
+import { SingleSlotQueue } from '../src/queue.js'
 
 const HELP = `texwatch —— 本地 LaTeX 编译预览
 
@@ -70,8 +72,37 @@ async function main() {
     process.exit(result.ok ? 0 : 1)
   }
 
-  console.error('watch 模式尚未实现，先用 --once')
-  process.exit(1)
+  const queue = new SingleSlotQueue(async (kind) => {
+    const result = await runCompile({ config, kind })
+    return result
+  })
+
+  queue.on('state', ({ state, kind }) => {
+    if (state === 'compiling') process.stdout.write(`\n编译中（${kind}）... `)
+    if (state === 'queued') process.stdout.write('[有新改动，排队中] ')
+  })
+
+  queue.on('result', ({ result }) => {
+    console.log(`${result.ok ? '成功' : '失败'}（${(result.durationMs / 1000).toFixed(1)}s）`)
+    const shown = result.diagnostics.filter((d) => d.severity === 'error')
+    const warnCount = result.diagnostics.length - shown.length
+    if (shown.length) console.log(formatDiagnostics(shown))
+    if (warnCount) console.log(`（另有 ${warnCount} 条警告）`)
+  })
+
+  queue.on('error', (err) => console.error('编译出错：', err.message))
+
+  const watcher = createWatcher({ config })
+  watcher.on('change', (kind) => queue.push(kind))
+
+  console.log(`正在监听 ${config.root}`)
+  console.log(`主文件：${config.mainTexRelative}${config.draft ? '（draft 模式）' : ''}`)
+  queue.push('full')
+
+  process.on('SIGINT', async () => {
+    await watcher.close()
+    process.exit(0)
+  })
 }
 
 main()
