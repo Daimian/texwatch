@@ -56,9 +56,13 @@ function nowMs() {
 
 // 递归找出 root 下所有「当前 mtime 已经 >= startedAt」的可监听文件。
 // 只在 chokidar 'ready' 之后调用一次，用途见 createWatcher 里的注释。
-async function scanForLateEdits(root, config, startedAt) {
+// isClosed 是个探针：如果扫描过程中 watcher 被 close() 了，尽快停止继续
+// 扫描——不是为了正确性（真正兜底关闭在 createWatcher 的 scheduleEmit
+// 里），只是不做已经没有意义的工作。
+async function scanForLateEdits(root, config, startedAt, isClosed) {
   const found = []
   async function walk(dir) {
+    if (isClosed()) return
     let entries
     try {
       entries = await fs.readdir(dir, { withFileTypes: true })
@@ -66,6 +70,7 @@ async function scanForLateEdits(root, config, startedAt) {
       return
     }
     for (const entry of entries) {
+      if (isClosed()) return
       if (config.ignoreDirs.includes(entry.name)) continue
       const full = path.join(dir, entry.name)
       if (entry.isDirectory()) {
@@ -88,6 +93,14 @@ export function createWatcher({ config, debounceMs = DEFAULT_DEBOUNCE_MS }) {
   const emitter = new EventEmitter()
   let pendingKind = null
   let timer = null
+
+  // close() 之后不得再对外发出 change、也不得再设置新的 setTimeout——一个
+  // close 之后残留的 setTimeout 会让事件循环排不空，`node --test` 之类需要
+  // 等事件循环排空才退出的场景会因此永久挂起（不是「代码不够整洁」，是真实
+  // 的挂起源）。closed 是唯一的关闭状态来源，两处入口都靠它短路：
+  // scheduleEmit 里（不设新 timer）、启动期补扫的循环体里（不继续扫描/派发）。
+  let closed = false
+  const isClosed = () => closed
 
   // 安全原则（贯穿本函数）：任何不确定的情况一律偏向「多编译一次」，绝不
   // 偏向「丢弃」。多编译最多浪费用户几秒钟；丢弃的表现是「保存了但什么都
@@ -115,6 +128,7 @@ export function createWatcher({ config, debounceMs = DEFAULT_DEBOUNCE_MS }) {
   })
 
   const scheduleEmit = (kind) => {
+    if (closed) return // 已关闭：绝不再设置新 timer，否则事件循环排不空
     pendingKind = mergeKind(pendingKind, kind)
     clearTimeout(timer)
     timer = setTimeout(() => {
@@ -168,8 +182,9 @@ export function createWatcher({ config, debounceMs = DEFAULT_DEBOUNCE_MS }) {
   // 时跑一次，不会重复触发）。用重复实验验证过：200 个文件、监听创建后立刻编辑
   // 主文件，0/20 次丢失（未加这一步之前是 0/20 次收到，几乎每次都丢）。
   watcher.on('ready', async () => {
-    const late = await scanForLateEdits(config.root, config, startedAt)
+    const late = await scanForLateEdits(config.root, config, startedAt, isClosed)
     for (const p of late) {
+      if (closed) break // 已关闭：不再继续派发补扫发现的变更
       const kind = classify(p, { config })
       if (kind) scheduleEmit(kind)
     }
@@ -178,6 +193,7 @@ export function createWatcher({ config, debounceMs = DEFAULT_DEBOUNCE_MS }) {
   return {
     on: (evt, cb) => emitter.on(evt, cb),
     close: async () => {
+      closed = true
       clearTimeout(timer)
       await watcher.close()
     },

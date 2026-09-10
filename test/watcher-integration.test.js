@@ -27,13 +27,18 @@ test('改 .tex 触发一次 change', async () => {
   const seen = []
   const w = createWatcher({ config, debounceMs: 50 })
   w.on('change', (kind) => seen.push(kind))
-  await tick(300) // 等 chokidar ready
+  try {
+    await tick(300) // 等 chokidar ready
 
-  await fs.writeFile(path.join(root, 'main.tex'), '\\documentclass{article}\n\\begin{document}\nchanged\n\\end{document}\n')
-  await tick(400)
+    await fs.writeFile(path.join(root, 'main.tex'), '\\documentclass{article}\n\\begin{document}\nchanged\n\\end{document}\n')
+    await tick(400)
 
-  assert.equal(seen.length, 1, `应该只触发一次，实际 ${JSON.stringify(seen)}`)
-  await w.close()
+    assert.equal(seen.length, 1, `应该只触发一次，实际 ${JSON.stringify(seen)}`)
+  } finally {
+    // 断言失败会直接 throw，跳过后面的 w.close()；不兜底的话，watcher 持有
+    // 的 chokidar/fsevents 原生句柄不会被释放，进程会挂起而不是报错退出。
+    await w.close()
+  }
 })
 
 test('防抖窗口内的多次保存合并成一次', async () => {
@@ -41,18 +46,21 @@ test('防抖窗口内的多次保存合并成一次', async () => {
   const seen = []
   const w = createWatcher({ config, debounceMs: 100 })
   w.on('change', (kind) => seen.push(kind))
-  await tick(300)
+  try {
+    await tick(300)
 
-  const f = path.join(root, 'main.tex')
-  await fs.writeFile(f, 'a')
-  await tick(20)
-  await fs.writeFile(f, 'b')
-  await tick(20)
-  await fs.writeFile(f, 'c')
-  await tick(400)
+    const f = path.join(root, 'main.tex')
+    await fs.writeFile(f, 'a')
+    await tick(20)
+    await fs.writeFile(f, 'b')
+    await tick(20)
+    await fs.writeFile(f, 'c')
+    await tick(400)
 
-  assert.equal(seen.length, 1)
-  await w.close()
+    assert.equal(seen.length, 1)
+  } finally {
+    await w.close()
+  }
 })
 
 test('同一窗口内改 tex 和 bib，kind 合并成 bib', async () => {
@@ -60,15 +68,18 @@ test('同一窗口内改 tex 和 bib，kind 合并成 bib', async () => {
   const seen = []
   const w = createWatcher({ config, debounceMs: 100 })
   w.on('change', (kind) => seen.push(kind))
-  await tick(300)
+  try {
+    await tick(300)
 
-  await fs.writeFile(path.join(root, 'SI.tex'), 'x')
-  await fs.writeFile(path.join(root, 'main.bib'), '@article{b,title={u}}\n')
-  await tick(400)
+    await fs.writeFile(path.join(root, 'SI.tex'), 'x')
+    await fs.writeFile(path.join(root, 'main.bib'), '@article{b,title={u}}\n')
+    await tick(400)
 
-  assert.equal(seen.length, 1)
-  assert.equal(seen[0], 'bib', 'bib 权重高于 tex')
-  await w.close()
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0], 'bib', 'bib 权重高于 tex')
+  } finally {
+    await w.close()
+  }
 })
 
 test('.texwatch 里的产物不触发 change', async () => {
@@ -80,13 +91,16 @@ test('.texwatch 里的产物不触发 change', async () => {
   const seen = []
   const w = createWatcher({ config, debounceMs: 50 })
   w.on('change', (kind) => seen.push(kind))
-  await tick(300)
+  try {
+    await tick(300)
 
-  await fs.writeFile(path.join(root, '.texwatch/build/main.pdf'), 'fake pdf')
-  await tick(300)
+    await fs.writeFile(path.join(root, '.texwatch/build/main.pdf'), 'fake pdf')
+    await tick(300)
 
-  assert.equal(seen.length, 0, '编译产物绝不能触发新的编译，否则会死循环')
-  await w.close()
+    assert.equal(seen.length, 0, '编译产物绝不能触发新的编译，否则会死循环')
+  } finally {
+    await w.close()
+  }
 })
 
 test('启动期编辑窗口：createWatcher 后立刻编辑不能被吞（大项目场景）', async () => {
@@ -126,6 +140,34 @@ test('启动期编辑窗口：createWatcher 后立刻编辑不能被吞（大项
     // 300 个文件的 watcher 持有真实的 fsevents 原生句柄：断言一旦失败就
     // 直接 throw，如果不用 try/finally 兜底关闭，进程会因为这个残留的
     // 原生句柄一直不退出——之前用旧实现故意让这条测试失败时就踩到过。
+    await w.close()
+  }
+})
+
+test('close() 之后不再发出 change，即使启动期补扫还在进行中', async () => {
+  // 复审读代码发现的问题：旧的 close() 只做了 clearTimeout(timer) +
+  // watcher.close()，完全没有理会「启动期补扫」（watcher.on('ready', ...)
+  // 里那个一次性扫描）。如果 close() 恰好在补扫还没跑完时被调用，补扫结束
+  // 后仍会调用 scheduleEmit，而 scheduleEmit 内部会重新设置一个新的
+  // setTimeout——于是关闭之后仍可能对外发出一次 change。更麻烦的是，这个
+  // close 之后残留的 setTimeout 会让事件循环排不空，`node --test` 得等
+  // 事件循环排空才退出，测试进程会因此永久挂起而不是正常结束。
+  //
+  // 这条测试直接把这个窗口拉到最大：createWatcher() 一返回，不等 ready、
+  // 不等任何 tick，立刻 close()——这时候补扫大概率还没开始，至少没跑完。
+  const { config } = await setup()
+  const seen = []
+  const w = createWatcher({ config, debounceMs: 50 })
+  w.on('change', (kind) => seen.push(kind))
+  try {
+    await w.close()
+    await tick(1000)
+
+    assert.equal(seen.length, 0, `close() 之后不应该再收到任何 change，实际 ${JSON.stringify(seen)}`)
+  } finally {
+    // close() 是幂等的（内部只是把 closed 置位、清 timer、调用一次
+    // chokidar 的 close），这里再调一次纯粹是防御性收尾，跟其它测试的
+    // try/finally 保持同一个模式。
     await w.close()
   }
 })
