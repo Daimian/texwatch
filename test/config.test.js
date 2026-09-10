@@ -50,3 +50,18 @@ test('pickMain: 多个候选且没有指定时抛错并带上候选列表', () =
 test('pickMain: 一个候选都没有时抛错', () => {
   assert.throws(() => pickMain({ cliArg: null, rcMain: null, candidates: [] }), /没有找到/)
 })
+
+test('isMainCandidate: \\% 是转义百分号，不启注释', () => {
+  const doc = '\\documentclass{article}\n100\\% 完成 \\begin{document}\n\\end{document}'
+  assert.equal(isMainCandidate(doc), true)
+})
+
+test('findPreambleEndLine: \\\\ 后紧跟 % 是真注释，其后的 begin{document} 不算', () => {
+  const doc = '\\documentclass{article}\nline\\\\%\\begin{document}\n\\begin{document}\nbody'
+  assert.equal(findPreambleEndLine(doc), 3)
+})
+
+test('findPreambleEndLine: 三个反斜杠后的 % 仍是转义，该行的 begin{document} 生效', () => {
+  const doc = '\\documentclass{article}\nx\\\\\\%y \\begin{document}\nbody'
+  assert.equal(findPreambleEndLine(doc), 2)
+})
