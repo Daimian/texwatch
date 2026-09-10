@@ -1,3 +1,6 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
+
 // 去掉行内注释后再判断，避免把被注释掉的 \documentclass 当真。
 // LaTeX 规则：% 前面连续反斜杠个数为奇数时，% 被转义（真百分号）；
 // 为偶数（含 0）时，% 启动注释，该行从这里截断。
@@ -46,4 +49,64 @@ export function pickMain({ cliArg, rcMain, candidates }) {
   )
   err.candidates = candidates
   throw err
+}
+
+const DEFAULTS = {
+  port: 3577,
+  draft: false,
+  watchExtensions: ['.tex', '.bib', '.cls', '.bst', '.png', '.jpg', '.jpeg', '.pdf', '.eps'],
+  ignoreDirs: ['.texwatch', '.git', 'node_modules'],
+}
+
+async function readRc(root) {
+  try {
+    return JSON.parse(await fs.readFile(path.join(root, '.texwatchrc.json'), 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+async function scanCandidates(root, ignoreDirs) {
+  const entries = await fs.readdir(root, { withFileTypes: true })
+  const found = []
+  for (const e of entries) {
+    if (!e.isFile() || !e.name.endsWith('.tex')) continue
+    const content = await fs.readFile(path.join(root, e.name), 'utf8')
+    if (isMainCandidate(content)) found.push(e.name)
+  }
+  return found.sort()
+}
+
+export async function resolveConfig({ cwd, cliArg = null, cliPort = null, cliDraft = null }) {
+  const root = path.resolve(cwd)
+  const rc = await readRc(root)
+
+  const ignoreDirs = rc.ignore ?? DEFAULTS.ignoreDirs
+  const watchExtensions = rc.watch ?? DEFAULTS.watchExtensions
+  const candidates = await scanCandidates(root, ignoreDirs)
+  const mainTexRelative = pickMain({ cliArg, rcMain: rc.main ?? null, candidates })
+  const mainTex = path.join(root, mainTexRelative)
+
+  const content = await fs.readFile(mainTex, 'utf8')
+  const preambleEndLine = findPreambleEndLine(content)
+  if (preambleEndLine === null) {
+    throw new Error(`${mainTexRelative} 里找不到 \\begin{document}，它不像是一个主文件`)
+  }
+
+  const draft = cliDraft ?? rc.draft ?? DEFAULTS.draft
+  const base = path.join(root, '.texwatch')
+
+  return {
+    root,
+    mainTex,
+    mainTexRelative,
+    preambleEndLine,
+    outDir: path.join(base, draft ? 'build-draft' : 'build'),
+    fmtDir: path.join(base, 'fmt'),
+    lastGoodPdf: path.join(base, draft ? 'last-good-draft.pdf' : 'last-good.pdf'),
+    port: cliPort ?? rc.port ?? DEFAULTS.port,
+    draft,
+    watchExtensions,
+    ignoreDirs,
+  }
 }
