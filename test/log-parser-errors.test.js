@@ -34,10 +34,16 @@ test('图片找不到：识别为缺图而不是缺宏包，不给 tlmgr 建议'
   assert.match(d.hint, /图片/)
 })
 
-test('每个 Diagnostic 都带原始日志片段', () => {
+test('每个 Diagnostic 的 raw 含其 message 的起始片段', () => {
   const diags = parseLog(fixture('undefined-cs.log'), '/proj')
   assert.ok(diags.length > 0)
-  for (const d of diags) assert.ok(typeof d.raw === 'string' && d.raw.length > 0)
+  for (const d of diags) {
+    assert.ok(typeof d.raw === 'string' && d.raw.length > 0)
+    assert.ok(
+      d.raw.includes(d.message.slice(0, 20)),
+      `raw 应包含 message 的起始部分，message=${d.message}`
+    )
+  }
 })
 
 test('空日志返回空数组', () => {
@@ -49,4 +55,9 @@ test('绝对路径被还原成相对项目根的路径', () => {
   const diags = parseLog(log, '/proj')
   assert.equal(diags[0].file, 'sub/chapter.tex')
   assert.equal(diags[0].line, 12)
+})
+
+test('消息正文里的 12:30: 不会被误判为文件与行号', () => {
+  const diags = parseLog('Some info line at 12:30: nothing wrong here\n', '/proj')
+  assert.deepEqual(diags, [])
 })

@@ -1,7 +1,7 @@
 import path from 'node:path'
 
 // -file-line-error 的错误行形态： ./main.tex:123: 消息
-const FILE_LINE_ERROR = /^(.+?):(\d+):\s*(.*)$/
+const FILE_LINE_ERROR = /^(\S+?):(\d+):\s*(.*)$/
 // 没有文件信息的裸错误行
 const BARE_ERROR = /^!\s*(.*)$/
 const MISSING_FILE = /File\s+[`'"]([^'"`]+)['"`]\s+not found/
