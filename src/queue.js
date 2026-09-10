@@ -37,6 +37,8 @@ export class SingleSlotQueue extends EventEmitter {
     } catch (err) {
       if (this.listenerCount('error') > 0) {
         this.emit('error', err)
+      } else {
+        console.error('[queue] 未被监听的 runner 异常：', err)
       }
     } finally {
       this.#running = false

@@ -81,3 +81,18 @@ test('广播 compiling / queued / idle 状态', async () => {
   assert.ok(states.includes('queued'))
   assert.equal(states.at(-1), 'idle')
 })
+
+test('runner 抛错且无 error 监听器时，兜底写入 stderr', async () => {
+  const captured = []
+  const original = console.error
+  console.error = (...args) => captured.push(args)
+  try {
+    const q = new SingleSlotQueue(async () => { throw new Error('boom') })
+    q.push('tex')
+    await new Promise((r) => setTimeout(r, 30))
+  } finally {
+    console.error = original
+  }
+  assert.equal(captured.length, 1)
+  assert.match(String(captured[0][0]), /queue/)
+})
