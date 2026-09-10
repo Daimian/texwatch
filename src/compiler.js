@@ -32,7 +32,15 @@ export function buildLatexmkArgs({ config, kind, fmtName }) {
     // 所以 draft 模式直接跳过 fmt（见计划开头「与 spec 的两处偏差」）
     args.push(`-usepretex=${DRAFT_PRETEX}`)
   } else if (fmtName) {
-    args.push(`-pdflatex=pdflatex %O "&${fmtName}" %S`)
+    // %S 必须用「反斜杠转义的引号」\"%S\"，而不是普通引号 "%S"：
+    // latexmk 解析 -pdflatex= 模板时会像 shell 一样按引号分词、并把未转义的引号当分词符剥掉，
+    // 所以普通 "%S" 传到 pdflatex 的 argv 里时引号已经被剥光，退化成跟不加引号完全一样的效果——
+    // 而 pdflatex/TeX 在 "&fmt file" 这种调用形式下会把各 argv 重新按空格拼接再解析一遍，
+    // 没有真正的引号字符存活下来，路径里的空格就会被从中拆开（Emergency stop，不产出 PDF）。
+    // 只有 \"%S\" 里的反斜杠转义引号能让 latexmk 把它当「转义出的字面双引号字符」而不是分词符，
+    // 从而让字面双引号字符真正出现在 pdflatex 收到的那个 argv 里，TeX 自己的解析器才能识别出
+    // 这是一个带空格的完整文件名。已用含空格的临时目录 + 真实 fmt 实跑验证，见 task-6-report.md。
+    args.push(`-pdflatex=pdflatex %O "&${fmtName}" \\"%S\\"`)
   }
 
   args.push(config.mainTex)

@@ -49,7 +49,13 @@ test('非 draft 且有 fmt 时，通过 -pdflatex 注入 &format', () => {
   const args = buildLatexmkArgs({ config: cfg, kind: 'tex', fmtName: 'texwatch-main' })
   const pdflatexArg = args.find((a) => a.startsWith('-pdflatex='))
   assert.ok(pdflatexArg, '应该有 -pdflatex= 参数')
-  assert.equal(pdflatexArg, '-pdflatex=pdflatex %O "&texwatch-main" %S', '引号必要，以避免 shell 把 & 当后台操作符')
+  assert.equal(
+    pdflatexArg,
+    '-pdflatex=pdflatex %O "&texwatch-main" \\"%S\\"',
+    '&fmt 用普通引号防 shell 把 & 当后台操作符；%S 必须用反斜杠转义的引号 \\"%S\\"——' +
+      '普通引号会被 latexmk 的模板分词器当分词符剥掉，退化成不加引号，' +
+      '导致 pdflatex/TeX 重新拼接 argv 时把含空格的路径拆开（已实测验证，见 task-6-report.md）'
+  )
 })
 
 test('COMPILE_ENV 关掉 TeX 的折行，日志才可解析', () => {
