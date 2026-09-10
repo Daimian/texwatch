@@ -171,3 +171,65 @@ test('close() 之后不再发出 change，即使启动期补扫还在进行中',
     await w.close()
   }
 })
+
+// 下面两条测试覆盖跨路径重复 emit 的竞态：实时路径（chokidar 的
+// add/change/unlink 事件）和启动期补扫（'ready' 之后的 scanForLateEdits）
+// 是两条独立路径，都可能观察到同一次编辑。曾经以为"顶多在同一个 debounce
+// 窗口内合并"，但补扫的延迟实测过从几 ms 到 370ms+ 都有、没有稳定上界，
+// 只要补扫比实时路径的 debounce flush 晚到超过 debounceMs，两者就会各自
+// 独立 emit 一次——同一次保存触发两次编译。
+//
+// 这个时序没法靠 tick() 掐时间可靠复现（补扫到底晚多久是不确定的），所以
+// 用 createWatcher 上仅供测试使用的 testOnlyLateScanDelayMs /
+// testOnlyLiveEventDelayMs 参数人为拖慢其中一条路径，确定性地构造出两种
+// 先后顺序，分别验证跨路径去重在两个方向上都生效。
+
+test('跨路径去重（实时先到、补扫后到）：同一次编辑只 emit 一次', async () => {
+  const { root, config } = await setup()
+  const seen = []
+  // debounceMs 很小，testOnlyLateScanDelayMs 远大于它：让实时路径的
+  // debounce 早早 flush 完，补扫晚很久才跑到，制造"补扫比实时路径的
+  // debounce flush 晚到超过 debounceMs"这个此前会导致重复 emit 的时序。
+  const w = createWatcher({ config, debounceMs: 50, testOnlyLateScanDelayMs: 500 })
+  w.on('change', (kind) => seen.push(kind))
+  try {
+    await tick(100) // 让真实的 chokidar ready 先发生（补扫本身仍会因为注入的延迟晚 500ms 才跑）
+
+    await fs.writeFile(path.join(root, 'main.tex'), '\\documentclass{article}\n\\begin{document}\nchanged\n\\end{document}\n')
+    await tick(200) // 实时路径的 debounce（50ms）早就 flush 完了
+
+    assert.equal(seen.length, 1, `实时路径 flush 后，补扫不应该再重复 emit，此时 seen=${JSON.stringify(seen)}`)
+
+    await tick(500) // 等被人为拖慢的补扫也跑完
+
+    assert.equal(seen.length, 1, `补扫迟到也不应该让同一次编辑触发第二次 emit，实际 seen=${JSON.stringify(seen)}`)
+  } finally {
+    await w.close()
+  }
+})
+
+test('跨路径去重（补扫先到、实时后到）：同一次编辑只 emit 一次', async () => {
+  const { root, config } = await setup()
+  const seen = []
+  // testOnlyLiveEventDelayMs 远大于 debounceMs：让补扫（不加延迟，'ready'
+  // 一到就跑）先处理完并 flush，实时路径的处理被人为拖慢到远晚于那次
+  // flush，制造相反方向的时序。
+  const w = createWatcher({ config, debounceMs: 50, testOnlyLiveEventDelayMs: 500 })
+  w.on('change', (kind) => seen.push(kind))
+  try {
+    // 关键：不等待，createWatcher() 一返回就立刻编辑——这时 chokidar 还没
+    // ready，真实的 mtime 已经 >= startedAt，补扫会在 'ready' 后把它当成
+    // 一次真实变更处理；实时事件即使原生层面确实派发了，处理也会被人为
+    // 拖慢 500ms。
+    await fs.writeFile(path.join(root, 'main.tex'), '\\documentclass{article}\n\\begin{document}\nchanged\n\\end{document}\n')
+    await tick(300) // 补扫应该早就跑完、flush 过一次了
+
+    assert.equal(seen.length, 1, `补扫 flush 后，被拖慢的实时事件不应该再重复 emit，此时 seen=${JSON.stringify(seen)}`)
+
+    await tick(500) // 等被人为拖慢的实时事件处理完
+
+    assert.equal(seen.length, 1, `实时事件迟到也不应该让同一次编辑触发第二次 emit，实际 seen=${JSON.stringify(seen)}`)
+  } finally {
+    await w.close()
+  }
+})

@@ -54,7 +54,9 @@ function nowMs() {
   return performance.timeOrigin + performance.now()
 }
 
-// 递归找出 root 下所有「当前 mtime 已经 >= startedAt」的可监听文件。
+// 递归找出 root 下所有「当前 mtime 已经 >= startedAt」的可监听文件，连同
+// 扫描时观察到的 mtimeMs 一起返回（调用方用它做跨路径去重，见 createWatcher
+// 里 scheduledMtimes 的说明，不需要为了去重再重新 stat 一次）。
 // 只在 chokidar 'ready' 之后调用一次，用途见 createWatcher 里的注释。
 // isClosed 是个探针：如果扫描过程中 watcher 被 close() 了，尽快停止继续
 // 扫描——不是为了正确性（真正兜底关闭在 createWatcher 的 scheduleEmit
@@ -78,7 +80,7 @@ async function scanForLateEdits(root, config, startedAt, isClosed) {
       } else if (entry.isFile() && shouldWatch(full, config)) {
         try {
           const stat = await fs.stat(full)
-          if (stat.mtimeMs >= startedAt) found.push(full)
+          if (stat.mtimeMs >= startedAt) found.push({ path: full, mtimeMs: stat.mtimeMs })
         } catch {
           // 扫描过程中文件被删掉了，忽略——对应的编辑本身也就不存在了
         }
@@ -89,10 +91,38 @@ async function scanForLateEdits(root, config, startedAt, isClosed) {
   return found
 }
 
-export function createWatcher({ config, debounceMs = DEFAULT_DEBOUNCE_MS }) {
+export function createWatcher({
+  config,
+  debounceMs = DEFAULT_DEBOUNCE_MS,
+  // --- 以下两个参数仅供测试使用 ---
+  // 生产代码（bin/texwatch.js）永远不传这两个参数，默认值 0 时完全不生效。
+  // 「实时路径」（chokidar 的 add/change/unlink 事件）和「启动期补扫」
+  // （'ready' 之后的 scanForLateEdits）谁先谁后是不确定的——补扫延迟实测
+  // 过从几 ms 到 370ms+ 都有，没有稳定上界，没法在测试里靠 tick() 掐时间
+  // 可靠地复现某一种先后顺序。这两个参数让测试能各自单独人为拖慢其中一条
+  // 路径，从而确定性地构造出「实时先到、补扫后到」和「补扫先到、实时后到」
+  // 这两种顺序，验证跨路径去重在两个方向上都生效。
+  testOnlyLiveEventDelayMs = 0,
+  testOnlyLateScanDelayMs = 0,
+}) {
   const emitter = new EventEmitter()
   let pendingKind = null
   let timer = null
+
+  // path -> 最近一次安排 emit 时该文件的 mtimeMs。实时路径和启动期补扫都
+  // 可能观察到同一次编辑：如果两条路径都判定它是「需要处理的变更」，且各自
+  // 观察到的 mtime 相同，说明是同一次写入被看到了两遍，只应该 emit 一次。
+  // 用 mtime 做键、而不是「哪条路径先处理过这个路径」这种一次性标记，是因为
+  // 这样和两条路径谁先谁后无关：不管补扫先到还是实时事件先到，后到的那条
+  // 只要发现 mtime 和已经记录的一致，就知道是重复，直接跳过；如果文件后来
+  // 又被真实编辑过（mtime 变了），仍然会正常调度一次新的 emit。
+  const scheduledMtimes = new Map()
+  const alreadyScheduled = (absPath, mtimeMs) => {
+    if (mtimeMs === undefined) return false // 拿不到 mtime，没法判断，交给调用方决定（偏向多调度）
+    if (scheduledMtimes.get(absPath) === mtimeMs) return true
+    scheduledMtimes.set(absPath, mtimeMs)
+    return false
+  }
 
   // close() 之后不得再对外发出 change、也不得再设置新的 setTimeout——一个
   // close 之后残留的 setTimeout 会让事件循环排不空，`node --test` 之类需要
@@ -151,9 +181,16 @@ export function createWatcher({ config, debounceMs = DEFAULT_DEBOUNCE_MS }) {
   // 一律放行——按上面的安全原则，宁可多判一次真实变更，也不能因为拿不到 stat
   // 就把它当幽灵事件吞掉。
   const onFsEvent = async (eventType, absPath) => {
+    if (testOnlyLiveEventDelayMs > 0) {
+      await new Promise((r) => setTimeout(r, testOnlyLiveEventDelayMs))
+      if (closed) return
+    }
+
+    let mtimeMs
     if (eventType !== 'unlink') {
       const stat = await fs.stat(absPath).catch(() => null)
       if (stat && stat.mtimeMs < startedAt) return // 幽灵事件，丢弃
+      mtimeMs = stat?.mtimeMs
     }
 
     // 第二道防线：即使 ignored 回调没拦住（比如目录判断出了偏差），classify
@@ -161,6 +198,10 @@ export function createWatcher({ config, debounceMs = DEFAULT_DEBOUNCE_MS }) {
     // null，绝不会让编译产物本身触发新一轮编译。
     const kind = classify(absPath, { config })
     if (!kind) return
+
+    // 跨路径去重：如果启动期补扫已经用同样的 mtime 处理过这个文件（补扫先
+    // 到、这次实时事件后到的情况），这里就不再重复调度。
+    if (alreadyScheduled(absPath, mtimeMs)) return
     scheduleEmit(kind)
   }
 
@@ -177,16 +218,28 @@ export function createWatcher({ config, debounceMs = DEFAULT_DEBOUNCE_MS }) {
   // 对此无能为力。
   //
   // 'ready' 触发后做一次性补扫：把当前 mtime >= startedAt 的文件都当成变更
-  // 处理一遍。就算某个文件的实时事件也正常到达过，这里重复处理一次，最多是
-  // debounce 窗口内多合并一次，不会引发重复编译或死循环（这个补扫只在 'ready'
-  // 时跑一次，不会重复触发）。用重复实验验证过：200 个文件、监听创建后立刻编辑
-  // 主文件，0/20 次丢失（未加这一步之前是 0/20 次收到，几乎每次都丢）。
+  // 处理一遍（这个补扫只在 'ready' 时跑一次，不会重复触发，不会引发死循环）。
+  // 用重复实验验证过：200 个文件、监听创建后立刻编辑主文件，0/20 次丢失
+  // （未加这一步之前是 0/20 次收到，几乎每次都丢）。
+  //
+  // 注意：这条路径和上面的实时路径完全独立，都可能观察到同一次编辑——曾经
+  // 以为"顶多在同一个 debounce 窗口内合并"，但复审用人为延迟 400ms 补扫的
+  // 方式实测证伪了这个假设：只要补扫比实时路径的 debounce flush 晚到超过
+  // debounceMs，两者就会各自独立 emit 一次，导致同一次保存触发两次编译。
+  // 靠 alreadyScheduled（按 mtime 去重，和先后顺序无关）堵住，而不是指望
+  // debounce 窗口的时序巧合。
   watcher.on('ready', async () => {
+    if (testOnlyLateScanDelayMs > 0) {
+      await new Promise((r) => setTimeout(r, testOnlyLateScanDelayMs))
+      if (closed) return
+    }
     const late = await scanForLateEdits(config.root, config, startedAt, isClosed)
-    for (const p of late) {
+    for (const { path: p, mtimeMs } of late) {
       if (closed) break // 已关闭：不再继续派发补扫发现的变更
       const kind = classify(p, { config })
-      if (kind) scheduleEmit(kind)
+      if (!kind) continue
+      if (alreadyScheduled(p, mtimeMs)) continue // 实时路径已经先处理过同一个 mtime
+      scheduleEmit(kind)
     }
   })
 
