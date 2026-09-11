@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
@@ -244,7 +245,20 @@ async function main() {
 // 的 bin 字段/shebang 调用）才跑 main()；被 test/cli-draft-race.test.js
 // 当模块 import 取 createCompileRunner/createResultHandler 时不能顺带把
 // main() 也跑起来（会拿测试进程的 cwd/argv 去解析真实项目、起真实服务）。
-const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+// 两侧都取 realpath 再比较：Node 加载模块时会解析符号链接（import.meta.url
+// 得到真实路径），而 path.resolve 不会（argv[1] 保持调用时的链接路径）。
+// npm link / npm i -g 正是用符号链接暴露命令的，只比较两者会让 main() 永不
+// 执行，表现为「敲 texwatch 什么都不发生、静默退出 0」。
+function realpathOrSelf(p) {
+  try {
+    return realpathSync(path.resolve(p))
+  } catch {
+    return path.resolve(p)
+  }
+}
+const isDirectRun =
+  process.argv[1] &&
+  realpathOrSelf(fileURLToPath(import.meta.url)) === realpathOrSelf(process.argv[1])
 if (isDirectRun) {
   main()
 }

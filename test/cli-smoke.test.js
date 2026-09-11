@@ -84,3 +84,37 @@ describe('--once：需要真实 TeX 环境', async () => {
     assert.match(r.stderr, /没有找到主文件/)
   })
 })
+
+// npm link / npm i -g 是通过**符号链接**暴露 `texwatch` 命令的，而上面所有用例
+// 都用真实路径 `[BIN, ...]` 调用，从未覆盖这条路径。Node 加载模块时会解析符号
+// 链接（import.meta.url 得到真实路径），但 path.resolve 不会（argv[1] 保持链接
+// 路径）—— 若 isDirectRun 用两者直接比较，经符号链接调用时 main() 永不执行，
+// 表现为「敲 texwatch 什么都不发生、静默退出 0」。
+async function makeSymlinkedBin() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'texwatch-link-'))
+  const link = path.join(dir, 'texwatch')
+  await fs.symlink(BIN, link)
+  return { dir, link }
+}
+
+test('经符号链接调用（npm link 的形态）时 --help 仍然输出用法', async () => {
+  const { dir, link } = await makeSymlinkedBin()
+  try {
+    const r = spawnSync(link, ['--help'], { encoding: 'utf8', timeout: 60_000 })
+    assert.equal(r.status, 0, `退出码应为 0，实际 ${r.status}`)
+    assert.match(r.stdout, /用法|texwatch/, `经符号链接调用时应输出用法，实际 stdout 为空或不含用法：${JSON.stringify(r.stdout)}`)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('经符号链接调用时未知参数仍然报错并以非零码退出', async () => {
+  const { dir, link } = await makeSymlinkedBin()
+  try {
+    const r = spawnSync(link, ['--nonsense'], { encoding: 'utf8', timeout: 60_000 })
+    assert.notEqual(r.status, 0, '未知参数应以非零码退出')
+    assert.match(r.stderr, /未知参数/)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
