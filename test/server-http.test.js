@@ -23,13 +23,15 @@ async function makeConfig() {
 test('findFreePort: 端口被占用时自动 +1', async () => {
   const blocker = net.createServer()
   await new Promise((r) => blocker.listen(0, r))
-  const taken = blocker.address().port
+  try {
+    const taken = blocker.address().port
 
-  const got = await findFreePort(taken)
-  assert.notEqual(got, taken)
-  assert.ok(got > taken)
-
-  await new Promise((r) => blocker.close(r))
+    const got = await findFreePort(taken)
+    assert.notEqual(got, taken)
+    assert.ok(got > taken)
+  } finally {
+    await new Promise((r) => blocker.close(r))
+  }
 })
 
 test('publishPdf: 拷贝到 last-good 并让版本号递增', async () => {
