@@ -1,2 +1,20 @@
 .texwatch/
 node_modules/
+
+# LaTeX 编译产物（texwatch 自己的产物都在 .texwatch/ 里，
+# 但手工跑 latexmk/pdflatex 时会在源目录留下这些）
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.spl
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+
+# 例外：这几个是真实采集的 TeX 日志样本，是测试数据不是产物
+!test/fixtures/logs/*.log
