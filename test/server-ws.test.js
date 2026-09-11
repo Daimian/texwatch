@@ -3,8 +3,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
 import { WebSocket } from 'ws'
 import { createServer } from '../src/server.js'
+
+const SERVER_JS_PATH = fileURLToPath(new URL('../src/server.js', import.meta.url))
 
 async function makeConfig() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'texwatch-ws-'))
@@ -140,6 +144,96 @@ test('客户端发来的 setDraft 会触发回调', async () => {
     }
   } finally {
     await srv.close()
+  }
+})
+
+// 复审发现的 Critical：wss.on('connection') 里只挂了 message 监听器，没挂
+// error 监听器。EventEmitter 对无人监听的 'error' 事件会直接 throw，超过
+// maxPayload（或任何协议错误帧）都会把整个 texwatch 进程带崩，而不只是
+// 断开那一个连接。这个回归必须用独立子进程复现——真的发一个超大帧会让
+// 没打补丁的实现直接崩溃退出整个进程，不能在当前测试进程里直接发，否则会
+// 把 npm test 自己带崩。
+async function startServerSubprocess(config) {
+  const scriptPath = path.join(
+    os.tmpdir(),
+    `texwatch-crash-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`
+  )
+  // 故意不加任何全局 uncaughtException 兜底，模拟 bin/texwatch.js 现状——
+  // 这样才能真实复现「没有 per-connection/wss 级 error 监听器就会整进程崩溃」。
+  const script = [
+    `import { createServer } from ${JSON.stringify(SERVER_JS_PATH)}`,
+    `const config = ${JSON.stringify(config)}`,
+    'const srv = await createServer({ config })',
+    "process.stdout.write('SERVER_UP ' + srv.url + '\\n')",
+    '',
+  ].join('\n')
+  await fs.writeFile(scriptPath, script)
+
+  const child = spawn(process.execPath, [scriptPath], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let stderr = ''
+  child.stderr.on('data', (d) => (stderr += d.toString()))
+
+  const url = await new Promise((resolve, reject) => {
+    let stdout = ''
+    let timer
+    function cleanup() {
+      clearTimeout(timer)
+      child.stdout.off('data', onData)
+      child.off('exit', onExit)
+    }
+    function onData(d) {
+      stdout += d.toString()
+      const m = stdout.match(/SERVER_UP (\S+)/)
+      if (m) {
+        cleanup()
+        resolve(m[1])
+      }
+    }
+    function onExit(code) {
+      cleanup()
+      reject(new Error(`子进程在启动阶段就退出了，code=${code}\nstderr: ${stderr}`))
+    }
+    child.stdout.on('data', onData)
+    child.once('exit', onExit)
+    timer = setTimeout(() => {
+      cleanup()
+      reject(new Error('等待子进程启动超时'))
+    }, 10_000)
+  })
+
+  return { child, url, scriptPath, getStderr: () => stderr }
+}
+
+test('超过 maxPayload 的帧不会让服务端进程崩溃（per-connection + wss 级 error 监听）', async () => {
+  const config = await makeConfig()
+  const { child, url, scriptPath, getStderr } = await startServerSubprocess(config)
+  try {
+    const ws = new WebSocket(`${url.replace('http', 'ws')}/ws`)
+    await new Promise((resolve, reject) => {
+      ws.once('open', resolve)
+      ws.once('error', reject)
+    })
+    ws.on('error', () => {}) // 客户端这边因协议错误被关闭是预期行为，不用关心
+
+    // src/server.js 里 maxPayload 是 1_000_000，发一个明显超过它的帧
+    const big = 'x'.repeat(2 * 1024 * 1024)
+    ws.send(big)
+
+    // 给子进程一点时间处理这帧——没打补丁的实现会在这里因为
+    // "Unhandled 'error' event" 崩溃退出整个进程
+    await new Promise((r) => setTimeout(r, 800))
+
+    assert.equal(
+      child.exitCode,
+      null,
+      `服务端子进程不应该崩溃退出（exitCode=${child.exitCode}）\nstderr:\n${getStderr()}`
+    )
+
+    const res = await fetch(`${url}/`)
+    assert.equal(res.status, 200, '发完超大帧之后，服务应该还活着，能正常响应后续请求')
+  } finally {
+    child.kill('SIGKILL')
+    await fs.rm(scriptPath, { force: true })
   }
 })
 

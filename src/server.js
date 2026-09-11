@@ -135,7 +135,25 @@ export async function createServer({ config }) {
     broadcast(state)
   }
 
+  // wss（WebSocketServer 实例）本身也会转发底层 http.Server 的 'error' 事件
+  // （见 ws 内部 addListeners(server, { error: wss.emit.bind(wss,'error') })），
+  // 这是和「单个连接的 error」完全独立的另一条路径：EventEmitter 对无人监听的
+  // 'error' 事件会直接 throw，不管是哪个 EventEmitter 实例。已实测验证：
+  // 手动 server.emit('error', ...) 会在没有这个监听器时把整个进程带崩。
+  wss.on('error', (err) => {
+    console.error('[server] wss 级错误：', err)
+  })
+
   wss.on('connection', (ws) => {
+    // 每个连接自己的 socket/协议错误（畸形帧、超过 maxPayload 等）也会走
+    // EventEmitter 的 'error' 事件；同样是「无人监听就 throw、带崩整个进程」，
+    // 且这条路径和上面 wss 级的 'error' 是两个不同的 EventEmitter 实例，必须
+    // 分别处理。已实测验证：不加这个监听器，客户端发一个超过 maxPayload 的
+    // 帧就会让整个 texwatch 进程崩溃退出。这里只需要防止崩溃——连接本身会被
+    // ws 库自动关闭，不需要额外处理。
+    ws.on('error', (err) => {
+      console.error('[server] WebSocket 连接错误：', err.message)
+    })
     // 新客户端立刻拿到完整状态，刷新页面才不会白屏
     ws.send(JSON.stringify({ ...state, pdfVersion: pdfVersionCounter }))
     ws.on('message', (data) => {
