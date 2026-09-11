@@ -128,7 +128,7 @@ Multiple Principal Elements: Novel Alloy Design Concepts and Outcomes, Advanced 
 1. 完全清空 `.texwatch/`（`rm -rf`），从无任何缓存/中间产物开始。
 2. 对非 draft outDir（`.texwatch/build`）先跑一次 `runCompile({kind:'full'})`（`-bibtex-cond -g`），latexmk 内部自动完成多轮 pdflatex/bibtex 收敛（本次实测收敛耗时 10.05s，用 `pdfinfo`/日志核实 34 页、0 处 `Citation...undefined`——与 M0 全量基准同一数量级，属于同一类"冷启动全量"操作，只是命令行参数与 M0 手动跑的 `latexmk -f -pdf ...` 略有不同）。
 3. **基准**与**有 fmt** 两组复用同一个已收敛的 `build/` outDir（只是是否传 `fmtName` 不同），因为这是它们之间唯一该变化的变量；**基准**测量前额外确认 `.texwatch/fmt` 不存在。
-4. **有 fmt + draft** 用独立的 `.texwatch/build-draft` outDir，同样先跑一次未计时的 `kind:'full'` 收敛（收敛耗时仅 1.48s——draft 跳过图片解码是主要原因，见下文分析），核实同样是 34 页、0 处未解析引用。
+4. **draft**（fmt 在 draft 模式下不生效，见下方修正说明）用独立的 `.texwatch/build-draft` outDir，同样先跑一次未计时的 `kind:'full'` 收敛（收敛耗时仅 1.48s——draft 跳过图片解码是主要原因，见下文分析），核实同样是 34 页、0 处未解析引用。
 5. 每种配置内部的 3 次测量连续进行（模拟用户连续多次保存），每次都是相对当前磁盘内容的真实翻转，不复用同一份.aux——引用/参考文献信息在三次测量之间没有变化，只有正文一个字符变化，属于真正的"增量编译"场景。
 
 **三种配置各 3 次原始耗时（秒）与中位数**：
@@ -137,9 +137,9 @@ Multiple Principal Elements: Novel Alloy Design Concepts and Outcomes, Advanced 
 |---|---|---|---|---|
 | 基准（无 fmt、无 draft） | 3.35 | 3.34 | 3.34 | **3.34s** |
 | 有 fmt（无 draft） | 3.20 | 3.20 | 3.20 | **3.20s** |
-| 有 fmt + draft | 0.52 | 0.51 | 0.51 | **0.51s** |
+| draft（fmt 在 draft 模式下不生效） | 0.52 | 0.51 | 0.51 | **0.51s** |
 
-（"有 fmt + draft"这一行里 `ensureFormat` 对 draft config 按设计短路返回 `null`——draft 与 fmt 是两种互斥的加速手段，见 `src/format-cache.js` 与 `src/compiler.js` 里 `buildLatexmkArgs` 的注释，所以这一行实际度量的是「draft 单独生效」的耗时。）
+**标签修正（复审发现，2026-09-11 修复轮 1）**：这一行最初标成"有 fmt + draft"是误导性的——根本不存在"draft + fmt 同时生效"这种状态。`buildLatexmkArgs` 里是 `if (config.draft) {...} else if (fmtName) {...}`，draft 分支一旦为真就无条件忽略 `fmtName`；`ensureFormat` 对 draft config 也直接短路返回 `null`（见 `src/format-cache.js`）。这是设计使然：draft 与 fmt 是两种重叠的加速手段（都是为了让单轮编译更快），没有必要叠加，所以实现上让 draft 优先、直接跳过 fmt。复审用真实实现验证过，强行给 draft config 传非 null 的 `fmtName` vs 传 `null`，耗时 512ms vs 508ms，在测量噪声范围内完全一致，进一步印证 `fmtName` 对 draft 分支确实没有任何效果。**这一行实测的实际上是"draft 单独生效"的耗时，数字本身不受影响，只是原标签描述的状态不存在。**
 
 **验收标准核对**：
 
