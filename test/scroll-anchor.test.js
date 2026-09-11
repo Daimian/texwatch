@@ -39,7 +39,10 @@ test('重新分页后页数变多，锚点仍落在同一页的同一相对位�
 test('页数变少时锚点被夹到最后一页，不会算出越界值', () => {
   const after = [{ offsetTop: 0, offsetHeight: 900 }]
   const restored = anchorToScrollTop(after, { page: 5, ratio: 0.5 })
-  assert.ok(restored >= 0 && restored <= 900)
+  // 精确断言，而不是区间断言：page:5 被夹到唯一的第 0 页后，结果应该恰好是
+  // 0 + 900 * 0.5 = 450。区间断言 `restored >= 0 && restored <= 900` 在
+  // ratio ∈ [0,1] 时对任何实现都几乎恒真，哪怕换算算错了也测不出来。
+  assert.equal(restored, 450)
 })
 
 test('没有页面时返回 0 而不是 NaN', () => {
