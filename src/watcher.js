@@ -14,6 +14,15 @@ function isIgnored(absPath, config) {
   return rel.split(path.sep).some((seg) => config.ignoreDirs.includes(seg))
 }
 
+// `changedLine` 在当前所有生产调用（下面 onFsEvent / 'ready' 补扫两处）里
+// 恒为 undefined——文件系统监听（chokidar）拿不到「改动发生在文件的第几
+// 行」，只能拿到「这个文件变了」。所以对主文件而言，下面的分支实际上恒走
+// `changedLine === undefined` 这条，主文件的改动因而恒被判为 'preamble'，
+// `tex` 态在生产中只会出现在非主文件（SI.tex/.cls/.bst/.sty）上。这不是
+// bug，是有意为之的保守设计（拿不到行号就宁可多 dump 一次 fmt，也不能用
+// 过期的 fmt 编出错误结果），实测性能影响接近零，因此不删 `changedLine` /
+// `preambleEndLine`——这个参数是留给未来某个能提供真实行号的调用方（比如
+// 编辑器插件通过 LSP 拿到光标位置）用的，当前只是还没有这样的调用方。
 export function classify(absPath, { config, changedLine }) {
   const fullPath = path.resolve(config.root, absPath)
   if (isIgnored(fullPath, config)) return null

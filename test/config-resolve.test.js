@@ -81,3 +81,42 @@ test('扫描时跳过 .texwatch 目录里的 tex', async () => {
   const cfg = await resolveConfig({ cwd: dir })
   assert.equal(cfg.mainTexRelative, 'paper.tex')
 })
+
+// 复审修复轮：Important 修复 2。rc.ignore 是整体替换（`rc.ignore ??
+// DEFAULTS.ignoreDirs`），用户按 README 写 `"ignore": ["out"]` 之前会把
+// `.texwatch` 从 ignoreDirs 里整体挤掉——而 src/watcher.js 的 classify 把
+// 「.texwatch 下的文件恒不触发编译」当成绝不失效的第二道防线，这道防线
+// 完全建立在 .texwatch 出现在 ignoreDirs 里这个前提上。前提一旦失效：
+// .texwatch/build/main.pdf 这类编译产物会被 classify 判成 'asset'（.pdf
+// 在默认 watchExtensions 里），每次编译写出 PDF 就再触发一次编译——无限
+// 循环、CPU 跑满。已实测复现过（见任务报告）。
+test('自定义 ignore（不含 .texwatch）时，.texwatch 仍无条件被忽略', async () => {
+  const dir = await makeProject({
+    'paper.tex': MINIMAL,
+    '.texwatchrc.json': JSON.stringify({ ignore: ['out'] }),
+  })
+  const cfg = await resolveConfig({ cwd: dir })
+
+  assert.ok(cfg.ignoreDirs.includes('.texwatch'), 'ignoreDirs 必须无条件包含 .texwatch')
+  assert.ok(cfg.ignoreDirs.includes('out'), '用户自定义的 ignore 项也要保留')
+})
+
+test('自定义 ignore 场景下，.texwatch 下的编译产物不会被 classify 判成需要触发编译的 asset', async () => {
+  const dir = await makeProject({
+    'paper.tex': MINIMAL,
+    '.texwatchrc.json': JSON.stringify({ ignore: ['out'] }),
+  })
+  const cfg = await resolveConfig({ cwd: dir })
+  const { classify } = await import('../src/watcher.js')
+
+  assert.equal(
+    classify(path.join(dir, '.texwatch/build/paper.pdf'), { config: cfg }),
+    null,
+    '.texwatch/build/ 下的编译产物必须被忽略，否则会形成无限编译循环'
+  )
+  assert.equal(
+    classify(path.join(dir, '.texwatch/last-good.pdf'), { config: cfg }),
+    null,
+    '.texwatch/last-good.pdf 必须被忽略'
+  )
+})

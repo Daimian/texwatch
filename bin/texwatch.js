@@ -52,16 +52,35 @@ export function createCompileRunner({ getCurrent, ensureFormat, runCompile }) {
   }
 }
 
+// --- 错误边界说明（复审修复轮：Critical 修复 1）---
+// 这个 handler 是通过 `queue.on('result', handler)` 挂上去的：src/queue.js
+// 里 `this.emit('result', { kind, result })` 是同步 emit（EventEmitter 的
+// emit 从不等待监听器返回的 promise，本任务也不允许改 queue.js 的接口）。
+// handler 本身是 async 函数，返回的 promise 没有任何人接、也没有人 .catch。
+// 一旦它在第一个 await 之后才 reject——比如下面的 publishPdf 在源 PDF 被
+// 另一个终端的 `texwatch --clean` 或 `latexmk -C` 删掉之后 reject（
+// test/server-http.test.js 里「publishPdf: 源文件不存在时 reject」已经
+// 证明这条路径真的会 reject）——这就是一个没人处理的 unhandledRejection，
+// Node 的默认行为是直接杀掉整个进程。对一个承诺「你只管写、我一直看着」的
+// 常驻工具，静默退出是最坏的失效形态。
+//
+// 这里整体包一层 try/catch：出错就用 console.error 报出来（不静默吞掉），
+// 然后让进程继续跑、等下一次文件变化再触发编译——风格照 src/queue.js 里
+// 「无监听器时 console.error 兜底」的先例。
 export function createResultHandler({ srv, publishPdf, onLog }) {
   return async ({ result }) => {
-    if (result.ok && result.pdfPath) await publishPdf(result.jobConfig, result.pdfPath)
-    srv.setState({
-      state: result.ok ? 'ok' : 'error',
-      durationMs: result.durationMs,
-      diagnostics: result.diagnostics,
-      pdfStale: !result.ok,
-    })
-    onLog?.(result)
+    try {
+      if (result.ok && result.pdfPath) await publishPdf(result.jobConfig, result.pdfPath)
+      srv.setState({
+        state: result.ok ? 'ok' : 'error',
+        durationMs: result.durationMs,
+        diagnostics: result.diagnostics,
+        pdfStale: !result.ok,
+      })
+      onLog?.(result)
+    } catch (err) {
+      console.error('[texwatch] 处理编译结果失败（PDF 可能已被外部删除）：', err.message)
+    }
   }
 }
 
@@ -78,6 +97,20 @@ const HELP = `texwatch —— 本地 LaTeX 编译预览
 `
 
 async function main() {
+  // 兜底防线（复审修复轮：Critical 修复 1）——加在 main() 内部而不是模块
+  // 顶层，是因为 test/cli-draft-race.test.js 只是把这个文件当模块 import
+  // 取 createCompileRunner/createResultHandler，并不会跑 main()；放在
+  // main() 里能保证只有真实 CLI 运行（isDirectRun）时才会注册这个全局
+  // 监听器，不会污染测试进程的事件监听、也不会掩盖测试里期望暴露的异常。
+  //
+  // 上面两处 try/catch 已经堵住了当前已知的两条会崩进程的路径，这道兜底是
+  // 防御未来新增的异步路径（新的 srv.onClientMessage 分支、新的 queue 事件
+  // 监听器等）重蹈覆辙——即使漏加了 try/catch，也不会让整个常驻 watch 进程
+  // 静默退出，而是打印出来、继续跑。同样不静默吞掉：console.error 报出来。
+  process.on('unhandledRejection', (err) => {
+    console.error('[texwatch] 未捕获的异步错误（进程不会退出，但请检查上面的报错）：', err)
+  })
+
   let args
   try {
     args = parseArgv(process.argv.slice(2))
@@ -161,18 +194,32 @@ async function main() {
 
   queue.on('error', (err) => console.error('编译出错：', err.message))
 
+  // --- 错误边界说明（复审修复轮：Critical 修复 1）---
+  // resolveConfig 用抛异常表达失败（比如主文件编辑到一半、暂时没有
+  // \begin{document}）。这个 handler 是从 src/server.js 里
+  // `for (const h of clientHandlers) h(parsed)` 即发即弃地调用的——那是个
+  // 同步 for 循环，同样不会、也没法等待 async handler 返回的 promise。
+  // 已实测复现：编辑主文件到「\begin{document} 暂时不在」的中间状态时，
+  // 点一下预览页的 draft 勾选框，await resolveConfig(...) 抛出，整个
+  // texwatch 进程直接崩溃退出，watch 会话没了。
+  // 包一层 try/catch：报错但不崩，且不改 `current`（try 块里 `current =`
+  // 这一行没跑到，`current` 自然保持切换前的值，不会产生半途而废的状态）。
   srv.onClientMessage(async (msg) => {
     if (msg.type !== 'setDraft') return
     if (Boolean(msg.value) === current.draft) return
 
-    current = await resolveConfig({
-      cwd: process.cwd(),
-      cliArg: current.mainTexRelative,
-      cliPort: current.port,
-      cliDraft: Boolean(msg.value),
-    })
-    srv.setState({ draft: current.draft, pdfStale: true })
-    queue.push('full')
+    try {
+      current = await resolveConfig({
+        cwd: process.cwd(),
+        cliArg: current.mainTexRelative,
+        cliPort: current.port,
+        cliDraft: Boolean(msg.value),
+      })
+      srv.setState({ draft: current.draft, pdfStale: true })
+      queue.push('full')
+    } catch (err) {
+      console.error('[texwatch] 切换 draft 模式失败（主文件可能正在编辑中）：', err.message)
+    }
   })
 
   const watcher = createWatcher({ config: current })
