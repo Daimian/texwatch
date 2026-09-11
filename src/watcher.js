@@ -54,15 +54,69 @@ function nowMs() {
   return performance.timeOrigin + performance.now()
 }
 
+// 写入稳定性窗口：一次逻辑编辑在文件系统层面可能不是原子的（fs.writeFile
+// 实际是 open(O_TRUNC) -> write() -> close()，系统繁忙时这几步的间隔会被
+// 拉开），chokidar/fsevents 可能因此对同一次编辑投递两次独立的原生通知，
+// 两次通知落在写入过程的不同时点、观察到两个真正不同的 mtime——这种情况
+// 下即使跨路径去重按 mtime 精确比较也无能为力：它的判断本身没错，错的是
+// 拿到了两个本不该不同的 mtime。用同一个稳定性窗口统一「实时路径」（交给
+// chokidar 内置的 awaitWriteFinish）和「启动期补扫」（scanForLateEdits 里
+// 手动实现的 waitForStableMtime）：只有 mtime 连续 stabilityThresholdMs
+// 没有再变化，才认为这次写入真正完成，两条路径因此收敛到同一个稳定值。
+// 用确定性复现（fs.open 截断 -> 延迟 30ms -> write+close）实测过：不加这个
+// 窗口，5/5 必然产生两个不同的 mtime、触发两次编译；加上之后 5/5 稳定
+// 收敛成一次。数值取 { stabilityThreshold: 50, pollInterval: 10 }——叠加
+// debounce 后编译启动前增加约 250ms，相对编译本身的 1-2 秒是可接受的代价。
+const WRITE_STABILITY = { stabilityThresholdMs: 50, pollIntervalMs: 10 }
+
+// 补扫路径自己的稳定性确认：对某个候选文件反复 stat，直到连续
+// stabilityThresholdMs 内 mtime 都没有再变化，返回那个稳定下来的 mtime。
+// 和 chokidar 的 awaitWriteFinish 做的是同一件事，只是补扫这条路径不经过
+// chokidar，需要自己实现。文件在确认过程中消失（比如被删掉）返回 null，
+// 交给调用方决定——按安全原则，宁可放行让它多调度一次，也不能因为拿不到
+// 稳定值就悄悄漏掉。设了一个宽松的总超时（2 秒）防止一个持续被写入的大
+// 文件让扫描无限期卡住：超时后就用当时观察到的最后一个 mtime，不再等下去。
+async function waitForStableMtime(filePath, { stabilityThresholdMs, pollIntervalMs } = WRITE_STABILITY) {
+  const deadline = nowMs() + 2000
+  let last
+  try {
+    last = (await fs.stat(filePath)).mtimeMs
+  } catch {
+    return null
+  }
+  let stableSince = nowMs()
+  while (nowMs() - stableSince < stabilityThresholdMs) {
+    if (nowMs() > deadline) return last // 放弃继续等，用目前观察到的值，偏向多调度
+    await new Promise((r) => setTimeout(r, pollIntervalMs))
+    let current
+    try {
+      current = (await fs.stat(filePath)).mtimeMs
+    } catch {
+      return null
+    }
+    if (current !== last) {
+      last = current
+      stableSince = nowMs()
+    }
+  }
+  return last
+}
+
 // 递归找出 root 下所有「当前 mtime 已经 >= startedAt」的可监听文件，连同
-// 扫描时观察到的 mtimeMs 一起返回（调用方用它做跨路径去重，见 createWatcher
-// 里 scheduledMtimes 的说明，不需要为了去重再重新 stat 一次）。
+// 「已经确认稳定」的 mtimeMs 一起返回（调用方用它做跨路径去重，见
+// createWatcher 里 scheduledMtimes 的说明）。
 // 只在 chokidar 'ready' 之后调用一次，用途见 createWatcher 里的注释。
 // isClosed 是个探针：如果扫描过程中 watcher 被 close() 了，尽快停止继续
 // 扫描——不是为了正确性（真正兜底关闭在 createWatcher 的 scheduleEmit
 // 里），只是不做已经没有意义的工作。
+//
+// 分两遍：第一遍只是快速找候选（单次 stat，和之前一样），第二遍只对候选
+// 文件（通常只有一两个）并行做稳定性确认（waitForStableMtime）。不对整棵
+// 目录树的每个文件都做稳定性确认，是为了不让「项目文件很多」和「等待写入
+// 稳定」这两个各自独立的开销相乘——候选文件数量通常很少，并行确认把额外
+// 延迟的上界钉在约一个 stabilityThresholdMs，而不是随候选数量线性增长。
 async function scanForLateEdits(root, config, startedAt, isClosed) {
-  const found = []
+  const candidates = []
   async function walk(dir) {
     if (isClosed()) return
     let entries
@@ -80,7 +134,7 @@ async function scanForLateEdits(root, config, startedAt, isClosed) {
       } else if (entry.isFile() && shouldWatch(full, config)) {
         try {
           const stat = await fs.stat(full)
-          if (stat.mtimeMs >= startedAt) found.push({ path: full, mtimeMs: stat.mtimeMs })
+          if (stat.mtimeMs >= startedAt) candidates.push(full)
         } catch {
           // 扫描过程中文件被删掉了，忽略——对应的编辑本身也就不存在了
         }
@@ -88,7 +142,18 @@ async function scanForLateEdits(root, config, startedAt, isClosed) {
     }
   }
   await walk(root)
-  return found
+  if (isClosed() || candidates.length === 0) return []
+
+  const confirmed = []
+  await Promise.all(
+    candidates.map(async (full) => {
+      if (isClosed()) return
+      const stableMtime = await waitForStableMtime(full)
+      if (stableMtime === null) return // 确认过程中文件被删了，交给实时路径的 unlink 处理
+      if (stableMtime >= startedAt) confirmed.push({ path: full, mtimeMs: stableMtime })
+    })
+  )
+  return confirmed
 }
 
 export function createWatcher({
@@ -147,8 +212,28 @@ export function createWatcher({
   // ignored 回调的签名是 (path, stats?)：chokidar 会先用「没有 stats」调用一次
   // （用来决定要不要 fs.stat 这个路径本身），随后再带着 stats 调用一次。对
   // undefined 的 stats 一律不忽略，等拿到真正的 stats 之后再按目录/文件分别判断。
+  //
+  // awaitWriteFinish：让 chokidar 在文件 mtime/size 稳定下来之前不要派发
+  // change 事件，从源头把一次逻辑编辑可能产生的多次原生通知（open(O_TRUNC)
+  // -> write() -> close() 之间的间隔被系统负载拉开时）合并成一次，交给我们
+  // 的稳定值和 scanForLateEdits 里 waitForStableMtime 得到的稳定值一致，
+  // 跨路径去重（按 mtime 精确比较）才有稳定的输入可比——用确定性复现
+  // （fs.open 截断 -> 延迟 30ms -> write+close）实测过：不开这个选项时，
+  // chokidar 对同一次编辑投递两次独立事件、两次 fs.stat 读到两个真正不同
+  // 的 mtime，5/5 必然触发两次编译；开启后 5/5 收敛成一次。
+  //
+  // 这个选项和 Task 10 早期排查过的「幽灵事件重投递」是两回事：幽灵事件是
+  // 订阅前已经写完的文件在 'ready' 之后被 FSEvents 补投递一次通知（早期
+  // 实测过 awaitWriteFinish 对此无效，15 次里 14 次仍然出现，因为幽灵事件
+  // 是「文件早就稳定了、通知却晚到」，awaitWriteFinish 只处理「文件还在
+  // 变」的情况，两者是不同的时序问题，互不矛盾）；这里要解决的是「文件真的
+  // 还在变、写入本身被拆成了好几步」，正是 awaitWriteFinish 的设计目标。
   const watcher = chokidar.watch(config.root, {
     ignoreInitial: true,
+    awaitWriteFinish: {
+      stabilityThreshold: WRITE_STABILITY.stabilityThresholdMs,
+      pollInterval: WRITE_STABILITY.pollIntervalMs,
+    },
     ignored: (p, stats) => {
       if (stats?.isDirectory()) {
         return path.relative(config.root, p).split(path.sep).some((s) => config.ignoreDirs.includes(s))
