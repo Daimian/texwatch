@@ -8,6 +8,7 @@ import { runCompile, hasTexToolchain } from '../src/compiler.js'
 import { createWatcher } from '../src/watcher.js'
 import { SingleSlotQueue } from '../src/queue.js'
 import { createServer, publishPdf } from '../src/server.js'
+import { ensureFormat } from '../src/format-cache.js'
 
 const HELP = `texwatch —— 本地 LaTeX 编译预览
 
@@ -74,13 +75,13 @@ async function main() {
     process.exit(result.ok ? 0 : 1)
   }
 
-  const srv = await createServer({ config })
+  let current = config
 
-  const { ensureFormat } = await import('../src/format-cache.js')
+  const srv = await createServer({ config: current, getConfig: () => current })
 
   const queue = new SingleSlotQueue(async (kind) => {
-    const fmtName = await ensureFormat(config)
-    const result = await runCompile({ config, kind, fmtName })
+    const fmtName = await ensureFormat(current)
+    const result = await runCompile({ config: current, kind, fmtName })
     return result
   })
 
@@ -91,7 +92,7 @@ async function main() {
   })
 
   queue.on('result', async ({ result }) => {
-    if (result.ok && result.pdfPath) await publishPdf(config, result.pdfPath)
+    if (result.ok && result.pdfPath) await publishPdf(current, result.pdfPath)
     srv.setState({
       state: result.ok ? 'ok' : 'error',
       durationMs: result.durationMs,
@@ -107,11 +108,25 @@ async function main() {
 
   queue.on('error', (err) => console.error('编译出错：', err.message))
 
-  const watcher = createWatcher({ config })
+  srv.onClientMessage(async (msg) => {
+    if (msg.type !== 'setDraft') return
+    if (Boolean(msg.value) === current.draft) return
+
+    current = await resolveConfig({
+      cwd: process.cwd(),
+      cliArg: current.mainTexRelative,
+      cliPort: current.port,
+      cliDraft: Boolean(msg.value),
+    })
+    srv.setState({ draft: current.draft, pdfStale: true })
+    queue.push('full')
+  })
+
+  const watcher = createWatcher({ config: current })
   watcher.on('change', (kind) => queue.push(kind))
 
-  console.log(`正在监听 ${config.root}`)
-  console.log(`主文件：${config.mainTexRelative}${config.draft ? '（draft 模式）' : ''}`)
+  console.log(`正在监听 ${current.root}`)
+  console.log(`主文件：${current.mainTexRelative}${current.draft ? '（draft 模式）' : ''}`)
   console.log(`预览地址：${srv.url}`)
   if (args.open) {
     spawn('open', [srv.url], { stdio: 'ignore', detached: true }).unref()

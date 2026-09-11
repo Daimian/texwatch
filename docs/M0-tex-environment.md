@@ -119,6 +119,51 @@ Multiple Principal Elements: Novel Alloy Design Concepts and Outcomes, Advanced 
 
 **参考文献渲染正常：是。bibtex 链路验证通过。**
 
+## M4 加速实测（Task 17，2026-09-11）
+
+**测量方法**：直接调用 texwatch 库函数（`resolveConfig` / `runCompile` / `ensureFormat`），绕过 HTTP/WS/watcher/debounce 层，只测「编译」本身耗时，避免这些层引入的测量噪声。脚本对每种配置切换正文中同一处安全锚点（`which rises in a stepwise` ↔ `which Rises in a stepwise`，纯大小写切换，不影响引用/页数/图表）模拟「改一个字保存」，每次翻转都相对磁盘上的当前内容判断，保证跨进程调用也一定是真实内容变化（不会出现「写了但内容没变、latexmk 判定无需重编」的假阳性）。
+
+**起始状态一致性保证**：
+
+1. 完全清空 `.texwatch/`（`rm -rf`），从无任何缓存/中间产物开始。
+2. 对非 draft outDir（`.texwatch/build`）先跑一次 `runCompile({kind:'full'})`（`-bibtex-cond -g`），latexmk 内部自动完成多轮 pdflatex/bibtex 收敛（本次实测收敛耗时 10.05s，用 `pdfinfo`/日志核实 34 页、0 处 `Citation...undefined`——与 M0 全量基准同一数量级，属于同一类"冷启动全量"操作，只是命令行参数与 M0 手动跑的 `latexmk -f -pdf ...` 略有不同）。
+3. **基准**与**有 fmt** 两组复用同一个已收敛的 `build/` outDir（只是是否传 `fmtName` 不同），因为这是它们之间唯一该变化的变量；**基准**测量前额外确认 `.texwatch/fmt` 不存在。
+4. **有 fmt + draft** 用独立的 `.texwatch/build-draft` outDir，同样先跑一次未计时的 `kind:'full'` 收敛（收敛耗时仅 1.48s——draft 跳过图片解码是主要原因，见下文分析），核实同样是 34 页、0 处未解析引用。
+5. 每种配置内部的 3 次测量连续进行（模拟用户连续多次保存），每次都是相对当前磁盘内容的真实翻转，不复用同一份.aux——引用/参考文献信息在三次测量之间没有变化，只有正文一个字符变化，属于真正的"增量编译"场景。
+
+**三种配置各 3 次原始耗时（秒）与中位数**：
+
+| 配置 | run 1 | run 2 | run 3 | 中位数 |
+|---|---|---|---|---|
+| 基准（无 fmt、无 draft） | 3.35 | 3.34 | 3.34 | **3.34s** |
+| 有 fmt（无 draft） | 3.20 | 3.20 | 3.20 | **3.20s** |
+| 有 fmt + draft | 0.52 | 0.51 | 0.51 | **0.51s** |
+
+（"有 fmt + draft"这一行里 `ensureFormat` 对 draft config 按设计短路返回 `null`——draft 与 fmt 是两种互斥的加速手段，见 `src/format-cache.js` 与 `src/compiler.js` 里 `buildLatexmkArgs` 的注释，所以这一行实际度量的是「draft 单独生效」的耗时。）
+
+**验收标准核对**：
+
+- 非 draft 增量 ≤ 2 秒：**未达标**。基准 3.34s、有 fmt 3.20s，均超出预算约 1.2–1.3 秒（超出 60%–67%）。
+- draft 增量 ≤ 1 秒：**达标**。0.51s，有充分余量。
+
+**与 M0 冷启动全量基准（13.7s）的关系**：两者衡量的不是同一件事，不能直接相除算倍数。M0 的 13.7s 是从完全干净状态、4 轮 pdflatex + 3 轮 bibtex 收敛出的**冷启动全量编译**；本次三组数字都是**在已收敛状态下只改一个字符**的**单轮增量编译**（`kind:'tex'`，`-bibtex-cond`、不带 `-g`，latexmk 判定只需跑一轮 pdflatex）。增量场景耗时远低于冷启动，这个差距主要来自 latexmk 自身的增量依赖判定（跳过不必要的多轮 bibtex/pdflatex 收敛），而不是 fmt 带来的效果——这正是上一轮报告"4 倍加速"把冷启动全量和增量搞混所产生的误判来源，本次予以更正。
+
+**fmt 收益有限，是本次实测的重要发现**：fmt 只让耗时从 3.34s 降到 3.20s，约 4%，观察不到"数倍加速"。对比之下，draft 让耗时从 3.34s 降到 0.51s，约 6.5 倍。用 `converge-nondraft`/`converge-draft` 两次首轮收敛耗时做交叉印证：非 draft 首轮收敛 10.05s，draft 首轮收敛仅 1.48s——差距的主要来源应是 draft 模式下 `\PassOptionsToPackage{draft}{graphicx}` 跳过了正文里多张 PNG 图片（`Figure1.png` 等，单张几百 KB 到 1.6MB）的解码与嵌入，而 fmt 预编译节省的只是 preamble 阶段的宏包加载/解析时间。对这篇论文而言，**宏包加载显然不是每轮编译耗时的主要构成部分，图片处理才是**，所以 fmt 这个杠杆在本项目上收益有限，是一个诚实、有价值的结论，而不是实现有问题。
+
+**draft 端到端验证**（通过真实 `texwatch main.tex` 服务 + WebSocket `setDraft` 消息，而非直接调库）：
+
+```
+首轮编译完成 state=ok draft=false durationMs=3225
+draft=false 时 /pdf 大小: 4299723 bytes
+（发送 {type:'setDraft', value:true}）
+收到 pdfStale 状态，draft=true
+draft 编译完成 state=ok draft=true durationMs=548
+draft=true 时 /pdf 大小: 406515 bytes
+体积比（draft/非draft）：0.0945
+```
+
+draft 模式下 PDF 体积降到非 draft 的 9.45%（约 10.6 倍缩小），与"图片画空框"的预期一致，端到端切换（浏览器勾选 → WebSocket 消息 → `resolveConfig` 重建 config → `queue.push('full')` 重编译 → `/pdf` 跟随 `getConfig().lastGoodPdf` 切换）验证通过。
+
 ## 已知的非阻塞性问题记录
 
 - `main.tex` 的 `\documentclass[...,authoryear]{elsarticle}` 与 `\bibliographystyle{elsarticle-num}` 不一致，导致每次编译 `pdflatex` 都会在 log 里报一条 `Package natbib Error: Bibliography not compatible with author-year citations`，并使进程退出码非零，即使编译内容完全正确。这是论文源文件本身的问题（推测是原作者在 Overleaf 上切换引用样式时遗留），不是本机环境问题，不建议在 M0 阶段修改论文仓库（论文仓库按要求保持在 `6da8f7f` 不动）。**texwatch 后续里程碑（尤其是 M4 判定"编译是否成功"的逻辑）必须知悉此问题**：不能仅凭 `latexmk`/`pdflatex` 的进程退出码判断成败。

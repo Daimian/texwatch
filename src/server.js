@@ -62,7 +62,7 @@ async function serveFile(res, filePath) {
   }
 }
 
-export async function createServer({ config }) {
+export async function createServer({ config, getConfig = () => config }) {
   const port = await findFreePort(config.port || 3577)
 
   const server = http.createServer(async (req, res) => {
@@ -93,7 +93,7 @@ export async function createServer({ config }) {
 
     if (url.pathname === '/pdf') {
       try {
-        const body = await fs.readFile(config.lastGoodPdf)
+        const body = await fs.readFile(getConfig().lastGoodPdf)
         res.writeHead(200, {
           'content-type': 'application/pdf',
           etag: `"v${pdfVersionCounter}"`,
