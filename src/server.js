@@ -3,6 +3,7 @@ import net from 'node:net'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { WebSocketServer } from 'ws'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const CLIENT_DIR = path.join(here, '..', 'client')
@@ -106,10 +107,63 @@ export async function createServer({ config }) {
     server.listen(port, '127.0.0.1', resolve)
   })
 
+  // maxPayload 防御超大帧：客户端只会发很小的控制消息（如 setDraft），
+  // 没有理由允许超大帧占用内存/带宽。
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 1_000_000 })
+
+  let state = {
+    state: 'idle',
+    kind: null,
+    durationMs: null,
+    diagnostics: [],
+    pdfVersion: pdfVersionCounter,
+    pdfStale: false,
+    draft: config.draft,
+  }
+
+  const clientHandlers = []
+
+  function broadcast(message) {
+    const payload = JSON.stringify(message)
+    for (const client of wss.clients) {
+      if (client.readyState === 1) client.send(payload)
+    }
+  }
+
+  function setState(partial) {
+    state = { ...state, ...partial, pdfVersion: pdfVersionCounter }
+    broadcast(state)
+  }
+
+  wss.on('connection', (ws) => {
+    // 新客户端立刻拿到完整状态，刷新页面才不会白屏
+    ws.send(JSON.stringify({ ...state, pdfVersion: pdfVersionCounter }))
+    ws.on('message', (data) => {
+      let parsed
+      try {
+        parsed = JSON.parse(data.toString())
+      } catch {
+        return // 非法 JSON（含空消息）直接忽略，不能让服务挂掉
+      }
+      // 只把「看起来像消息」的对象转发给回调，防止 `5`、`"foo"`、`null`
+      // 这类合法 JSON 但非预期形状的输入传播到业务逻辑里。
+      if (typeof parsed !== 'object' || parsed === null) return
+      for (const h of clientHandlers) h(parsed)
+    })
+  })
+
   return {
     port,
     url: `http://127.0.0.1:${port}`,
     httpServer: server,
-    close: () => new Promise((r) => server.close(r)),
+    broadcast,
+    setState,
+    getState: () => state,
+    onClientMessage: (cb) => clientHandlers.push(cb),
+    close: async () => {
+      for (const c of wss.clients) c.terminate()
+      await new Promise((r) => wss.close(r))
+      await new Promise((r) => server.close(r))
+    },
   }
 }

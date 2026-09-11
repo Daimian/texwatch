@@ -75,7 +75,8 @@ test('GET /pdf 在还没有 last-good 时返回 404', async () => {
 test('GET /pdf 返回 PDF 且带 ETag', async () => {
   const config = await makeConfig()
   const src = path.join(config.outDir, 'main.pdf')
-  await fs.writeFile(src, '%PDF-1.5 body')
+  const body = '%PDF-1.5 body'
+  await fs.writeFile(src, body)
   await publishPdf(config, src)
 
   const srv = await createServer({ config })
@@ -84,9 +85,17 @@ test('GET /pdf 返回 PDF 且带 ETag', async () => {
     assert.equal(res.status, 200)
     assert.equal(res.headers.get('content-type'), 'application/pdf')
     assert.ok(res.headers.get('etag'), '必须带 ETag')
+    assert.equal(await res.text(), body, '响应体必须就是已发布的 PDF 内容')
   } finally {
     await srv.close()
   }
+})
+
+test('publishPdf: 源文件不存在时 reject', async () => {
+  const config = await makeConfig()
+  const missing = path.join(config.outDir, 'does-not-exist.pdf')
+
+  await assert.rejects(() => publishPdf(config, missing))
 })
 
 test('未知路径返回 404', async () => {

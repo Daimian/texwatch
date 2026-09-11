@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
 import { parseArgv, formatDiagnostics } from '../src/cli-args.js'
 import { resolveConfig } from '../src/config.js'
 import { runCompile, hasTexToolchain } from '../src/compiler.js'
 import { createWatcher } from '../src/watcher.js'
 import { SingleSlotQueue } from '../src/queue.js'
+import { createServer, publishPdf } from '../src/server.js'
 
 const HELP = `texwatch —— 本地 LaTeX 编译预览
 
@@ -72,17 +74,27 @@ async function main() {
     process.exit(result.ok ? 0 : 1)
   }
 
+  const srv = await createServer({ config })
+
   const queue = new SingleSlotQueue(async (kind) => {
     const result = await runCompile({ config, kind })
     return result
   })
 
   queue.on('state', ({ state, kind }) => {
+    srv.setState({ state, kind })
     if (state === 'compiling') process.stdout.write(`\n编译中（${kind}）... `)
     if (state === 'queued') process.stdout.write('[有新改动，排队中] ')
   })
 
-  queue.on('result', ({ result }) => {
+  queue.on('result', async ({ result }) => {
+    if (result.ok && result.pdfPath) await publishPdf(config, result.pdfPath)
+    srv.setState({
+      state: result.ok ? 'ok' : 'error',
+      durationMs: result.durationMs,
+      diagnostics: result.diagnostics,
+      pdfStale: !result.ok,
+    })
     console.log(`${result.ok ? '成功' : '失败'}（${(result.durationMs / 1000).toFixed(1)}s）`)
     const shown = result.diagnostics.filter((d) => d.severity === 'error')
     const warnCount = result.diagnostics.length - shown.length
@@ -97,10 +109,15 @@ async function main() {
 
   console.log(`正在监听 ${config.root}`)
   console.log(`主文件：${config.mainTexRelative}${config.draft ? '（draft 模式）' : ''}`)
+  console.log(`预览地址：${srv.url}`)
+  if (args.open) {
+    spawn('open', [srv.url], { stdio: 'ignore', detached: true }).unref()
+  }
   queue.push('full')
 
   process.on('SIGINT', async () => {
     await watcher.close()
+    await srv.close()
     process.exit(0)
   })
 }
