@@ -178,3 +178,147 @@ draft 模式下 PDF 体积降到非 draft 的 9.45%（约 10.6 倍缩小），�
 - `main.tex` 全量编译（干净状态，`latexmk -f -pdf -interaction=nonstopmode -file-line-error main.tex`）耗时：**约 13.7 秒**（real time）
 - 页数：本地 **34** 页 / Overleaf 约 **34** 页（人类伙伴口述约数）—— 判据 33–35 页区间内视为一致 —— **对比结论：一致，验收通过**
 - 参考文献渲染正常：是（`pdftotext` 检查零 `[?]`，`main.blg` 显示 106 条条目全部正常处理，最终 log 中 0 处 `Citation ... undefined`）
+
+## 最终验收（2026-09-11，Task 18）
+
+对照 spec 第八节的四条验收标准逐条实测，结果如实记录，不达标不美化。全部验证均在
+`~/workplace/Latex/paper` 的**临时副本**（`/private/tmp/.../scratchpad/paper-copy`）上进行，
+未改动原论文仓库；验证结束后临时副本已删除，原仓库复核仍在 `6da8f7f`、`main.tex` 零 diff。
+
+| 标准 | 结果 |
+|---|---|
+| 页数与 Overleaf 一致 | 本地 34 页 / Overleaf 约 34 页 —— **一致** |
+| 非 draft 增量 ≤ 2s | 实测 3.34s（基准）/ 3.20s（有 fmt）—— **未达标**（超出约 60%–67%） |
+| draft 增量 ≤ 1s | 实测 0.51s —— **达标** |
+| 报错时 PDF 不消失、行号准确 | **是**（细节见下） |
+| 断网全流程可用 | 未做真实关网测试；以下三项等价证据均通过，**结论：有充分把握断网可用，但最终确认需要人工关 WiFi 实测一次** |
+
+### 1. 页数一致（复测）
+
+在临时副本上清空 `.texwatch/` 及全部中间产物后跑：
+
+```
+$ node bin/texwatch.js --once main.tex
+编译 main.tex ... 成功（13.6s）
+[错误] .texwatch/build/main.aux:194  Package natbib Error: Bibliography not compatible with author-year citations.
+（另有 11 条警告）
+PDF：.../paper-copy/.texwatch/build/main.pdf
+
+$ pdfinfo .texwatch/build/main.pdf | grep Pages
+Pages:           34
+```
+
+34 页，与本文档前半部分记录的 M0 基准（本地 34 页 / Overleaf 约 34 页）一致。`ok` 判定为
+`成功`，尽管日志里仍有那条已知的 natbib 非致命错误（见上文「已知的非阻塞性问题记录」）——
+这是 `runCompile` 故意的设计（`ok` 看 PDF 是否真的产出/更新，不只看退出码），不是本次新发现
+的问题。
+
+### 2. 速度：非 draft 未达标，draft 达标
+
+直接引用 Task 17 的严格实测（本文档上一节「M4 加速实测」），未重测：
+
+- 基准（无 fmt）：**3.34s**，超出 2s 预算约 67%
+- 有 fmt（无 draft）：**3.20s**，超出 2s 预算约 60%
+- draft：**0.51s**，在 1s 预算内有充分余量
+
+**非 draft 增量未达成 ≤2s 的验收标准。** 根因见上文「fmt 收益有限」一节：这篇论文的单轮编译
+耗时主要由图片嵌入（多张几百 KB–1.6MB 的 PNG）主导，而不是宏包加载/解析，fmt 只优化后者，
+所以只省约 4%；draft 跳过图片解码，是唯一能把耗时压到预算内的杠杆。这是诚实的实测结论，不
+通过放宽标准或重新选择测量口径来掩盖。
+
+### 3. 编译报错时 PDF 不消失、行号准确（本次实测）
+
+在临时副本上跑 `texwatch --port 3599 --no-open main.tex`（真实服务，非 `--once`），首次全量
+编译成功后，`curl -s -o /dev/null -w '%{http_code} %{size_download}' http://127.0.0.1:3599/pdf`
+确认为 `200 4299723`（与 `.texwatch/build/main.pdf` 一致）。
+
+**测试 A —— 常见的"打字错误"类错误（非致命，pdflatex 会跳过继续完成编译）**：
+在正文摘要段落插入一个不存在的命令 `\thisCommandDoesNotExistTexwatchTest`（第 158 行），
+保存后 watcher 触发重编译，输出：
+
+```
+编译中（preamble）... 成功（3.3s）
+[错误] .texwatch/build/main.aux:194  Package natbib Error: ...
+[错误] main.tex:158  Undefined control sequence.
+（另有 11 条警告）
+```
+
+`main.tex:158` 精确指向改坏的那一行。这类错误 pdflatex 在 `nonstopmode` 下会跳过继续编译完
+成，`ok` 判定为成功，PDF 正常刷新（这是正确行为，不是"该失败却没失败"）。
+
+**测试 B —— 真正阻断编译的致命错误**：撤销测试 A 后，改成在同一位置插入一个故意不闭合的
+`\textbf{...`（左花括号无匹配右花括号，会导致 TeX 一路吞到文件末尾、`Runaway argument`），
+保存后：
+
+```
+编译中（preamble）... 失败（0.4s）
+[错误] File ended while scanning use of \textbf .
+[错误] Emergency stop.
+[错误] ==> Fatal error occurred, no output PDF file produced!
+```
+
+**在这个"失败"状态期间**（未修复之前）立刻请求：
+
+```
+$ curl -s -o /tmp/during-failure.pdf -w '%{http_code} %{size_download}' http://127.0.0.1:3599/pdf
+200 4299723
+```
+
+`/pdf` 返回 HTTP 200、大小仍是 4299723 字节，MD5 与失败之前那份成功产物完全一致（`47805f0...`）
+——不是 404，不是空文件，是上一次成功编译的原样内容。撤销这处改动、保存后自动恢复成功
+（13.0s，触发了一次完整重收敛），`main.tex` 复原后与原始论文仓库该文件逐字节 diff 为零。
+
+**这两个测试合起来覆盖了验收标准要求的两点**：① 常见错误场景下诊断准确指向 `main.tex:<行号>`
+（测试 A）；② 真正编译失败时 `/pdf` 不消失、仍返回上一次成功内容（测试 B）。需要如实说明的一点
+限制：测试 B 这类"一路吞到文件末尾"的 TeX 致命错误，pdflatex 自身在这种错误形态下就不会给出
+`file:line` 前缀（`grep 'main.tex:' main.log` 在这次失败的 log 里确认为零命中）——这是
+`-file-line-error` 对这一类错误固有的局限，不是 texwatch 的日志解析缺陷；对于绝大多数能被
+`-file-line-error` 定位的错误类型（未定义命令、缺文件等），texwatch 都能给出准确行号（测试 A
+即是一例）。
+
+### 4. 断网可用（等价证据，非真实关网测试）
+
+**未执行** brief 原计划里 `networksetup -setairportpower en0 off` 的真实关网步骤——运行本任务
+的会话依赖网络连接到 API，关闭 WiFi 会直接切断当前会话，属于不可接受的风险，因此改用三项等
+价证据：
+
+**证据 1：进程级 —— 只有本地监听，零出站连接。**
+起一个真实的 `texwatch` 后台进程后，用 `lsof -i -a -p <pid> -P -n` 查看它持有的全部 socket：
+
+```
+COMMAND   PID USER   FD   TYPE  DEVICE SIZE/OFF NODE NAME
+node    70442 mian   12u  IPv4  ...    0t0      TCP 127.0.0.1:3599 (LISTEN)
+```
+
+唯一一条记录：监听 `127.0.0.1:3599`，没有任何出站（`->`）连接。进程从启动、编译、到关闭全程
+没有发起过任何网络请求。
+
+**证据 2：静态扫描 —— 代码里没有会被加载的外链。**
+
+```
+$ grep -rnE "https?://" client/index.html client/app.js client/scroll-anchor.js client/version-tracker.js src/ bin/
+src/server.js:69:    const url = new URL(req.url, `http://${req.headers.host}`)
+src/server.js:181:    url: `http://127.0.0.1:${port}`,
+```
+
+命中的两处都是构造本地回环地址用的字符串模板，不是外部链接。`client/vendor/` 下的 pdf.js 库
+文件本身含 26 处 `http(s)://`（Apache 许可证头、SVG 命名空间字符串、`new URL(x, "https://foo.bar")`
+这种仅用作相对路径解析基准的占位符），但没有一处是本项目会触发的真实网络请求——`client/app.js`
+给 pdf.js 传的 `standardFontDataUrl` 是同源相对路径 `/vendor/pdfjs/standard_fonts/`（由 texwatch
+自己的静态文件服务器本地提供），`workerSrc` 是 `/vendor/pdfjs/pdf.worker.mjs`，`cMapUrl`/
+`wasmUrl` 均未设置（不使用，也就不会触发 pdf.js 内部那段按 `cMapUrl`/`wasmUrl` 判断是否用
+`fetch` 的逻辑）。
+
+**证据 3：依赖本地化。**
+
+- `git ls-files client/vendor | wc -l` → `18`，pdf.js（`pdf.mjs`/`pdf.worker.mjs`/
+  `standard_fonts/` 全部字体文件）已整份提交进仓库，不依赖 CDN。
+- 运行时依赖（`package.json` `dependencies`）只有 `{"chokidar":"^5.0.0","ws":"^8.21.3"}`，
+  没有任何会在运行期按需下载的包。
+- TeX 宏包已由 `tlmgr` 本地装好（见本文档前半部分「额外安装的包」一节），编译过程不联网
+  拉取任何 `.sty`/`.cls`。
+
+**结论**：三项等价证据充分支持"texwatch 运行时不发起任何网络请求、断网应当可用"这一判断，
+但这不等于真实断网测试——网卡状态、DNS、系统级网络栈行为等只有实际关闭 WiFi 才能验证到。
+**这一步的最终确认需要人工执行**：关闭 WiFi 后跑一次 `texwatch main.tex`，确认编译、预览、
+浏览器控制台均无网络请求失败，再重新打开 WiFi。
