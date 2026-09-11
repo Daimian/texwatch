@@ -7,6 +7,7 @@
 // 写法是直接传 `canvas`——pdf.js 内部会自己用 canvas.getContext('2d', {...}) 取上下文
 // （见 pdf.mjs 里 InternalRenderTask#initializeGraphics）。这里用 `canvas` 形式。
 import * as pdfjsLib from '/vendor/pdfjs/pdf.mjs'
+import { captureAnchor, anchorToScrollTop } from '/scroll-anchor.js'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'
 
@@ -21,7 +22,31 @@ let renderedVersion = -1
 const scale = 1.4
 let ws = null
 
+// 并发渲染的版本仲裁：onMessage 与 renderPdf 之间没有互斥，携带不同 pdfVersion
+// 的两条消息背靠背到达（连续保存两次、触发两次成功编译）时会并发跑两次
+// renderPdf()——各自独立地 getDocument / 逐页 render，谁先跑完就先 replaceChildren
+// 一次，最终显示哪个版本取决于谁先完成，而不是谁更新。而 renderedVersion 早就
+// 被 onMessage 同步更新成最新值了，不会再有消息来纠正，用户就会看到旧 PDF 却
+// 毫无提示。
+//
+// 用一个单调递增的 token 做仲裁：每次调用 renderPdf 时占用一个新 token；只有在
+// DOM 写入（replaceChildren / 滚动恢复）的那一刻，token 仍是最新的那次调用才
+// 允许写入，否则整份渲染结果直接丢弃。因为 onMessage 是按消息到达顺序同步调用
+// renderPdf 的（JS 单线程，调用发生在任何 await 之前），"最后一次发起调用" 必然
+// 对应 "最新的 pdfVersion"，不需要额外传版本号比较。
+let renderToken = 0
+
 async function renderPdf() {
+  const myToken = ++renderToken
+
+  // 用「视口顶部所在页号 + 页内相对偏移比例」而不是绝对 scrollTop：改一段文字
+  // 可能导致后面全部内容重新分页，绝对偏移会飘。
+  const before = [...pagesEl.querySelectorAll('canvas')].map((c) => ({
+    offsetTop: c.offsetTop,
+    offsetHeight: c.offsetHeight,
+  }))
+  const anchor = captureAnchor(before, window.scrollY)
+
   const doc = await pdfjsLib.getDocument({
     url: `/pdf?v=${Date.now()}`,
     standardFontDataUrl: '/vendor/pdfjs/standard_fonts/',
@@ -41,7 +66,27 @@ async function renderPdf() {
     frag.appendChild(canvas)
   }
 
+  // 这次渲染在异步过程中已经被更新的一次调用（更高的 token）超越——说明中途
+  // 又有一条更新的 pdfVersion 消息到达并发起了新的渲染。丢弃这次结果，不碰
+  // DOM，让更新的那次渲染负责最终显示。
+  if (myToken !== renderToken) return
+
   pagesEl.replaceChildren(frag)
+
+  // 布局要等一帧才稳定，否则 offsetTop 全是 0
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
+
+  // 等这一帧的过程中也可能被更新的渲染超越（它会在自己的写入点用同样的 DOM
+  // 再刷一次），这里就不必再恢复滚动位置了。
+  if (myToken !== renderToken) return
+
+  if (before.length > 0) {
+    const after = [...pagesEl.querySelectorAll('canvas')].map((c) => ({
+      offsetTop: c.offsetTop,
+      offsetHeight: c.offsetHeight,
+    }))
+    window.scrollTo({ top: anchorToScrollTop(after, anchor), behavior: 'instant' })
+  }
 }
 
 function renderStatus(msg) {
@@ -96,14 +141,34 @@ async function onMessage(msg) {
   }
 }
 
+// 指数退避重连的当前延迟，成功连上一次后重置。
+let retryDelay = 500
+
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`)
-  // 必须在 `new WebSocket(...)` 之后同步挂上 onmessage，不能先 await 连接建立
-  // （比如等 onopen 或者一个 "open" Promise）再挂监听器。服务端在
-  // wss.on('connection') 里同步发送第一条完整状态，如果客户端挂监听器慢了一拍，
-  // 这条消息会永久丢失，刷新页面就会白屏，要等下一次编译才有内容。
+  // 必须在 `new WebSocket(...)` 之后紧接着同步挂上 onmessage，不能先 await 连接
+  // 建立（比如放进 onopen，或者等一个 "open" Promise）再挂监听器，重连时也一样。
+  // 服务端在 wss.on('connection') 里同步发送第一条完整状态，如果客户端挂监听器
+  // 慢了一拍，这条消息会永久丢失——重连后页面会白屏，要等下一次编译才有内容。
   ws.onmessage = (e) => onMessage(JSON.parse(e.data))
-  ws.onerror = (err) => console.error('WebSocket 错误', err)
+
+  ws.onopen = () => {
+    retryDelay = 500
+    statusEl.classList.remove('error')
+  }
+
+  ws.onclose = () => {
+    summaryEl.textContent = '与 texwatch 断开，重连中…'
+    statusEl.className = 'error'
+    setTimeout(connect, retryDelay)
+    retryDelay = Math.min(retryDelay * 2, 10_000)
+  }
+
+  ws.onerror = (err) => {
+    console.error('WebSocket 错误', err)
+    // 触发 onclose 里的重连逻辑；避免同一次失败重复安排两次重连。
+    ws.close()
+  }
 }
 
 draftEl.addEventListener('change', () => {
