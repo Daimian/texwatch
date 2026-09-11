@@ -40,14 +40,21 @@ test('改了宏包时 hash 变化', () => {
 })
 
 test('formatName 从主文件名生成合法的 format 名', () => {
-  assert.equal(formatName('main.tex'), 'texwatch-main')
-  assert.equal(formatName('SI_test.tex'), 'texwatch-SI_test')
+  const n1 = formatName('main.tex')
+  const n2 = formatName('SI_test.tex')
+  // 应以 texwatch- 开头，以 hash 后缀结尾
+  assert.match(n1, /^texwatch-main-[0-9a-f]{8}$/)
+  assert.match(n2, /^texwatch-SI_test-[0-9a-f]{8}$/)
 })
 
 test('formatName 把路径分隔符和点换成安全字符', () => {
   const n = formatName('sub/dir/my.paper.tex')
   assert.ok(!n.includes('/'))
-  assert.ok(!n.slice('texwatch-'.length).includes('.'))
+  // 格式应为 texwatch-<安全字符>-<hash>
+  assert.match(n, /^texwatch-.+-[0-9a-f]{8}$/)
+  // 中间部分（texwatch- 和 hash 之间）不应包含点
+  const middle = n.replace(/^texwatch-/, '').replace(/-[0-9a-f]{8}$/, '')
+  assert.ok(!middle.includes('.'))
 })
 
 test('preamble 里有被注释掉的 \\begin{document} 出现在真实那行之前时，抽取到的内容仍包含真实 preamble 的全部宏包声明', () => {
@@ -113,4 +120,61 @@ body
   const percentLine = lines.find(l => l.includes('100\\% sure'))
   assert.ok(percentLine)
   assert.ok(!percentLine.includes('这也是注释'))
+})
+
+test('formatName 消除点和斜杠碰撞（a.b.tex 与 a/b.tex 应不同）', () => {
+  const n1 = formatName('a.b.tex')
+  const n2 = formatName('a/b.tex')
+  assert.notEqual(n1, n2)
+})
+
+test('formatName 消除空格和横杠碰撞（a b.tex 与 a-b.tex 应不同）', () => {
+  const n1 = formatName('a b.tex')
+  const n2 = formatName('a-b.tex')
+  assert.notEqual(n1, n2)
+})
+
+test('formatName 结果只含 [A-Za-z0-9_-]，无 shell 元字符', () => {
+  // 测试各种危险字符
+  const testCases = [
+    'file with spaces.tex',
+    'file`whoami`.tex',
+    'file$var.tex',
+    'file;cmd.tex',
+    'file|pipe.tex',
+    'file&bg.tex',
+    "file'quote.tex",
+    'file"quote.tex',
+    'file\nnewline.tex',
+  ]
+  for (const path of testCases) {
+    const result = formatName(path)
+    // 应该只包含 [A-Za-z0-9_-]
+    assert.match(result, /^texwatch-[A-Za-z0-9_-]+-[0-9a-f]{8}$/, `formatName('${path}') should be safe`)
+  }
+})
+
+test('formatName 确定性：同一输入多次调用结果相同', () => {
+  const inputs = ['main.tex', 'sub/dir/file.tex', 'path with spaces.tex']
+  for (const input of inputs) {
+    const result1 = formatName(input)
+    const result2 = formatName(input)
+    const result3 = formatName(input)
+    assert.equal(result1, result2, `formatName('${input}') should be deterministic`)
+    assert.equal(result2, result3, `formatName('${input}') should be deterministic`)
+  }
+})
+
+test('formatName 支持非 ASCII 文件名，产出合法名字', () => {
+  const names = [
+    '论文.tex',
+    'papier français.tex',
+    '日本語.tex',
+    '🎉emoji🎊.tex',
+  ]
+  for (const name of names) {
+    const result = formatName(name)
+    // 应该以 texwatch- 开头，以 hash 结尾，中间只有 [A-Za-z0-9_-]
+    assert.match(result, /^texwatch-[A-Za-z0-9_-]+-[0-9a-f]{8}$/, `formatName('${name}') should produce safe name`)
+  }
 })
