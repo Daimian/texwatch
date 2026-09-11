@@ -1,9 +1,11 @@
 import crypto from 'node:crypto'
 import path from 'node:path'
+import { stripComments } from './config.js'
 
 export function extractPreamble(content) {
-  const idx = content.indexOf('\\begin{document}')
-  return idx === -1 ? '' : content.slice(0, idx)
+  const stripped = stripComments(content)
+  const idx = stripped.indexOf('\\begin{document}')
+  return idx === -1 ? '' : stripped.slice(0, idx)
 }
 
 export function preambleHash(preamble) {

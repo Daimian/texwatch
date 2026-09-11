@@ -20,7 +20,7 @@ function stripCommentFromLine(line) {
   return line
 }
 
-function stripComments(content) {
+export function stripComments(content) {
   return content.split('\n').map(stripCommentFromLine).join('\n')
 }
 
