@@ -63,7 +63,11 @@ async function serveFile(res, filePath) {
 }
 
 export async function createServer({ config, getConfig = () => config }) {
-  const port = await findFreePort(config.port || 3577)
+  // 用 ?? 而不是 ||：显式传 port: 0（「让操作系统随便分配一个空闲端口」）
+  // 不能被当成「没传」而回退到默认值 3577——否则并发跑多个 server 的测试会
+  // 全部挤到 3577 上用 findFreePort 探测，而 findFreePort 探测完关闭 socket
+  // 到真正 listen 之间存在 TOCTOU 空隙，并发下必然撞车。
+  const requestedPort = config.port ?? 3577
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`)
@@ -108,10 +112,26 @@ export async function createServer({ config, getConfig = () => config }) {
     res.writeHead(404).end('not found')
   })
 
-  await new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(port, '127.0.0.1', resolve)
-  })
+  let port
+  if (requestedPort === 0) {
+    // port: 0 = 让操作系统原子地分配一个空闲临时端口，彻底跳过 findFreePort
+    // 的「探测端口 -> 关闭探测 socket -> 真正 listen」流程——那个流程中间有
+    // 一段空隙，并发下多个 server 可能探测到同一个「看起来空闲」的端口，
+    // 都去 listen 就会 EADDRINUSE。交给操作系统分配则没有这个空隙。
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    port = server.address().port
+  } else {
+    // 生产路径：行为不变，仍然从 requestedPort（默认 3577）开始探测，
+    // 端口被占用时依次 +1。
+    port = await findFreePort(requestedPort)
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(port, '127.0.0.1', resolve)
+    })
+  }
 
   // maxPayload 防御超大帧：客户端只会发很小的控制消息（如 setDraft），
   // 没有理由允许超大帧占用内存/带宽。
