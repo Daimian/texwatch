@@ -8,6 +8,7 @@
 // （见 pdf.mjs 里 InternalRenderTask#initializeGraphics）。这里用 `canvas` 形式。
 import * as pdfjsLib from '/vendor/pdfjs/pdf.mjs'
 import { captureAnchor, anchorToScrollTop } from '/scroll-anchor.js'
+import { createVersionTracker } from '/version-tracker.js'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'
 
@@ -19,35 +20,10 @@ const diagEl = document.getElementById('diagnostics')
 const draftEl = document.getElementById('draft')
 
 // 版本记账：决定「要不要为这条消息里的 pdfVersion 发起一次新渲染」，以及渲染
-// 失败时该不该把 renderedVersion 回滚，好让后续同版本的消息还能再次触发渲染。
-//
-// 这段逻辑的算法在 client/version-tracker.js 里有一份带完整测试
-// （test/version-tracker.test.js）的纯函数版本，本来应该像 scroll-anchor.js
-// 那样直接 `import ... from '/version-tracker.js'`。但那需要在
-// src/server.js 里新加一条静态文件路由，而本轮修复被要求不碰 src/ 下任何
-// 文件（新路由要不要加、什么时候加，留给复审裁定——见任务报告）。所以这里是
-// 手写的等价实现，写法上刻意贴近 version-tracker.js 的结构（claim/fail 两个
-// 操作、相同的回滚条件），方便逐行对照，但确实是两份需要手动保持同步的代码，
-// 记在报告的顾虑里。
-let renderedVersion = -1
-
-function claimVersion(version) {
-  const previousVersion = renderedVersion
-  renderedVersion = version
-  let settled = false
-  return {
-    fail() {
-      if (settled) return
-      settled = true
-      // 只有在没有更晚的一次 claim 已经把 renderedVersion 推进到别的版本时，
-      // 才回滚到这次 claim 之前的版本——避免用一次旧的失败结果覆盖新版本
-      // 已经声明的状态。渲染被下面的 renderToken 仲裁静默放弃（不是失败，
-      // renderPdf() 会正常 resolve、不抛异常）时根本不会调用这个 fail()，
-      // renderedVersion 维持在新版本是正确的。
-      if (renderedVersion === version) renderedVersion = previousVersion
-    },
-  }
-}
+// 失败时该不该把已渲染版本回滚，好让后续同版本的消息还能再次触发渲染。算法与
+// 测试见 client/version-tracker.js / test/version-tracker.test.js——这里只有
+// 一份实现，测试验证的就是实际运行的这份。
+const versionTracker = createVersionTracker()
 
 const scale = 1.4
 let ws = null
@@ -161,8 +137,8 @@ async function onMessage(msg) {
   // 只有 pdfVersion 真正变化才重新拉取/渲染 PDF——否则每条状态消息（哪怕只是
   // "编译中"）都会触发一次 getDocument + 全页重绘，白白闪烁。pdfVersion 为 0
   // 表示还没有编译成功过一次，此时 /pdf 还不存在，不必请求。
-  if (msg.pdfVersion !== renderedVersion && msg.pdfVersion > 0) {
-    const claim = claimVersion(msg.pdfVersion)
+  if (versionTracker.shouldRender(msg.pdfVersion)) {
+    const claim = versionTracker.claim(msg.pdfVersion)
     try {
       await renderPdf()
     } catch (err) {
@@ -194,7 +170,7 @@ function connect() {
     // 触发一次重渲染，不完全依赖上面 claim/fail 的回滚逻辑覆盖到所有失败
     // 场景（比如某次失败是在还没来得及调用 claim.fail() 之前，页面本身就被
     // 关掉重开的极端情况）。
-    renderedVersion = -1
+    versionTracker.reset()
   }
 
   ws.onclose = () => {

@@ -73,6 +73,9 @@ export async function createServer({ config }) {
     if (url.pathname === '/scroll-anchor.js') {
       return serveFile(res, path.join(CLIENT_DIR, 'scroll-anchor.js'))
     }
+    if (url.pathname === '/version-tracker.js') {
+      return serveFile(res, path.join(CLIENT_DIR, 'version-tracker.js'))
+    }
 
     if (url.pathname.startsWith('/vendor/')) {
       const rel = url.pathname.slice('/vendor/'.length)
