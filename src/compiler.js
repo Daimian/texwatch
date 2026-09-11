@@ -57,11 +57,18 @@ export async function hasTexToolchain() {
   })
 }
 
-function spawnCapture({ cmd, args, cwd, timeoutMs }) {
+function spawnCapture({ cmd, args, cwd, timeoutMs, config }) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, {
       cwd,
-      env: { ...process.env, ...COMPILE_ENV },
+      env: {
+        ...process.env,
+        ...COMPILE_ENV,
+        // fmt 文件被 dump 到 config.fmtDir，pdflatex 默认不会去那里找，
+        // 需要显式加进 TEXFORMATS 搜索路径。末尾的冒号表示「然后再搜索默认路径」，
+        // 不能省——省掉的话默认的 pdflatex.fmt 就找不到了，非 fmt 编译会全部失败。
+        ...(config?.fmtDir ? { TEXFORMATS: `${config.fmtDir}:` } : {}),
+      },
     })
 
     let output = ''
@@ -153,6 +160,7 @@ export async function runCompile({
     args,
     cwd: config.root,
     timeoutMs,
+    config,
   })
 
   // latexmk 的 stdout 不含完整信息，真正的日志在 outDir 里的 .log。

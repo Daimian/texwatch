@@ -76,8 +76,11 @@ async function main() {
 
   const srv = await createServer({ config })
 
+  const { ensureFormat } = await import('../src/format-cache.js')
+
   const queue = new SingleSlotQueue(async (kind) => {
-    const result = await runCompile({ config, kind })
+    const fmtName = await ensureFormat(config)
+    const result = await runCompile({ config, kind, fmtName })
     return result
   })
 
