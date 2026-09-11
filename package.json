@@ -1,0 +1,19 @@
+{
+  "name": "texwatch",
+  "version": "0.1.0",
+  "description": "本地 LaTeX 编译预览流水线",
+  "type": "module",
+  "bin": { "texwatch": "./bin/texwatch.js" },
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test 'test/**/*.test.js'",
+    "vendor:pdfjs": "node scripts/vendor-pdfjs.js"
+  },
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "pdfjs-dist": "^6.3.289"
+  }
+}
